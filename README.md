@@ -31,7 +31,7 @@ Uploads from jurisdictions, TA provider interactions and deliveries, travel spen
 3. Open a terminal and change into that directory:
 
 ```bash
-   cd path/to/HRSA64_TA_Portal
+   cd path/to/HRSA64_TA_Portal/Monthly_report_pineline
    python report.py
 ```
 
