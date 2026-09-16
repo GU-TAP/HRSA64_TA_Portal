@@ -3205,6 +3205,106 @@ if "Entered By" not in df_int.columns:
 if "Entered By" not in df_del.columns:
     df_del["Entered By"] = ""
 
+
+# --- Automatic de-duplication of Interaction / Delivery logs ----------------------------
+# Two rows are the same entry when every key field below matches. The Delivery sheet has
+# no Jurisdiction column (report.py joins it from Main), so its key can't include one.
+INTERACTION_DEDUP_KEYS = [
+    "Ticket ID", "Jurisdiction", "Date of Interaction", "Type of Interaction", "Short Summary",
+]
+DELIVERY_DEDUP_KEYS = [
+    "Ticket ID", "Date of Delivery", "Type of Delivery", "Short Summary",
+]
+
+
+def _dedup_text(val):
+    """Normalize a text cell for comparison: trim, collapse whitespace, case-fold."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = re.sub(r"\s+", " ", str(val)).strip()
+    if s.lower() in ("nan", "nat", "none"):
+        return ""
+    return s.casefold()
+
+
+def _dedup_date(val):
+    """Normalize a date cell to YYYY-MM-DD so '2026-09-16' and '2026-09-16 00:00:00' match."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "nat", "none"):
+        return ""
+    try:
+        parsed = pd.to_datetime(s, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return _dedup_text(s)
+
+
+def dedupe_log_sheet(df_log, keys, date_col=None, doc_col="Document"):
+    """
+    Remove duplicate log rows, keeping the most recent submission of each group.
+
+    Rows match when every key field is equal after normalization (whitespace collapsed,
+    case-insensitive, dates compared as calendar dates). Within a duplicate group the
+    survivor is the LAST row that carries a Document link; if none of them do, it is
+    simply the last row. This keeps an uploaded attachment from being dropped when
+    someone re-submits the same entry without re-attaching the file.
+
+    Rows whose key fields are all blank are never treated as duplicates of one another.
+
+    Returns (deduped_dataframe, rows_removed).
+    """
+    if df_log is None or df_log.empty:
+        return df_log, 0
+
+    present_keys = [k for k in keys if k in df_log.columns]
+    if not present_keys:
+        return df_log, 0
+
+    has_doc = None
+    if doc_col in df_log.columns:
+        has_doc = [bool(_dedup_text(v)) for v in df_log[doc_col].tolist()]
+
+    keep_positions = []
+    groups = {}
+    for pos in range(len(df_log)):
+        row = df_log.iloc[pos]
+        key = tuple(
+            _dedup_date(row.get(k)) if (date_col and k == date_col) else _dedup_text(row.get(k))
+            for k in present_keys
+        )
+        if not any(key):
+            # Nothing identifying in this row - leave it exactly where it is.
+            keep_positions.append(pos)
+            continue
+        groups.setdefault(key, []).append(pos)
+
+    for positions in groups.values():
+        chosen = positions[-1]
+        if has_doc is not None:
+            with_doc = [p for p in positions if has_doc[p]]
+            if with_doc:
+                chosen = with_doc[-1]
+        keep_positions.append(chosen)
+
+    keep_positions = sorted(set(keep_positions))
+    removed = len(df_log) - len(keep_positions)
+    if removed <= 0:
+        return df_log, 0
+    return df_log.iloc[keep_positions].reset_index(drop=True), removed
+
+
+def _report_dedup(removed, label):
+    """Tell the submitter when older duplicate rows were cleaned up by this submission."""
+    if removed > 0:
+        st.info(
+            f"🧹 Removed {removed} earlier duplicate {label} "
+            f"{'entry' if removed == 1 else 'entries'} matching this one."
+        )
+
 @st.cache_data(ttl=600)
 def load_support_sheet():
     return pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'GA_Support'))
@@ -4912,6 +5012,11 @@ else:
                                     # Replace NaN with empty strings to ensure JSON compatibility
                                     updated_sheet1 = updated_sheet1.fillna("")
                                     spreadsheet2 = client.open('HRSA64_TA_Request')
+                                    # Auto-remove earlier duplicates of this entry before writing back.
+                                    updated_sheet1, _dupes_removed = dedupe_log_sheet(
+                                        updated_sheet1, INTERACTION_DEDUP_KEYS, date_col="Date of Interaction"
+                                    )
+                                    _report_dedup(_dupes_removed, "interaction")
                                     worksheet2 = spreadsheet2.worksheet('Interaction')
                                     worksheet2.update([updated_sheet1.columns.values.tolist()] + updated_sheet1.values.tolist())
 
@@ -5047,6 +5152,11 @@ else:
                                     # Replace NaN with empty strings to ensure JSON compatibility
                                     updated_sheet2 = updated_sheet2.fillna("")
                                     spreadsheet3 = client.open('HRSA64_TA_Request')
+                                    # Auto-remove earlier duplicates of this entry before writing back.
+                                    updated_sheet2, _dupes_removed = dedupe_log_sheet(
+                                        updated_sheet2, DELIVERY_DEDUP_KEYS, date_col="Date of Delivery"
+                                    )
+                                    _report_dedup(_dupes_removed, "delivery")
                                     worksheet3 = spreadsheet3.worksheet('Delivery')
                                     worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
 
@@ -7151,6 +7261,11 @@ GU-TAP System
                                 
                                 # Get the worksheet first
                                 spreadsheet3 = client.open('HRSA64_TA_Request')
+                                # Auto-remove earlier duplicates of this entry before writing back.
+                                updated_sheet2, _dupes_removed = dedupe_log_sheet(
+                                    updated_sheet2, INTERACTION_DEDUP_KEYS, date_col="Date of Interaction"
+                                )
+                                _report_dedup(_dupes_removed, "interaction")
                                 worksheet3 = spreadsheet3.worksheet('Interaction')
                                 worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
 
@@ -8599,6 +8714,11 @@ GU-TAP System
                                 # Replace NaN with empty strings to ensure JSON compatibility
                                 updated_sheet2 = updated_sheet2.fillna("")
                                 spreadsheet3 = client.open('HRSA64_TA_Request')
+                                # Auto-remove earlier duplicates of this entry before writing back.
+                                updated_sheet2, _dupes_removed = dedupe_log_sheet(
+                                    updated_sheet2, DELIVERY_DEDUP_KEYS, date_col="Date of Delivery"
+                                )
+                                _report_dedup(_dupes_removed, "delivery")
                                 worksheet3 = spreadsheet3.worksheet('Delivery')
                                 worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
 
@@ -9926,6 +10046,11 @@ GU-TAP System
                                             lambda x: x.strftime("%Y-%m-%d")
                                             if isinstance(x, (datetime, pd.Timestamp)) else x
                                         ).fillna("")
+                                        # Auto-remove earlier duplicates of this entry before writing back.
+                                        ra_updated_int, _dupes_removed = dedupe_log_sheet(
+                                            ra_updated_int, INTERACTION_DEDUP_KEYS, date_col="Date of Interaction"
+                                        )
+                                        _report_dedup(_dupes_removed, "interaction")
                                         ra_ws_int = client.open("HRSA64_TA_Request").worksheet("Interaction")
                                         ra_ws_int.update(
                                             [ra_updated_int.columns.values.tolist()]
@@ -10024,6 +10149,11 @@ GU-TAP System
                                             lambda x: x.strftime("%Y-%m-%d")
                                             if isinstance(x, (datetime, pd.Timestamp)) else x
                                         ).fillna("")
+                                        # Auto-remove earlier duplicates of this entry before writing back.
+                                        ra_updated_del, _dupes_removed = dedupe_log_sheet(
+                                            ra_updated_del, DELIVERY_DEDUP_KEYS, date_col="Date of Delivery"
+                                        )
+                                        _report_dedup(_dupes_removed, "delivery")
                                         ra_ws_del = client.open("HRSA64_TA_Request").worksheet("Delivery")
                                         ra_ws_del.update(
                                             [ra_updated_del.columns.values.tolist()]
