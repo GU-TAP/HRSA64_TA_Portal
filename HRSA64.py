@@ -14,6 +14,8 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
+import smtplib
+from email.message import EmailMessage
 from mailjet_rest import Client
 import openpyxl
 from openpyxl.styles import PatternFill
@@ -477,8 +479,25 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json),
 client = gspread.authorize(creds)
 
 
-def send_email_mailjet(to_email, subject, body):
-    """Send email via Mailjet and return success status"""
+EMAIL_SENDER_NAME = "GU-TAP System"
+
+
+def _email_transport():
+    """
+    Which sending backend to use. Set in Streamlit secrets:
+
+        [email]
+        transport = "gmail"     # or "mailjet" (default)
+
+    Defaults to mailjet so nothing changes until the Gmail credentials are in place.
+    """
+    try:
+        return str(st.secrets["email"]["transport"]).strip().lower()
+    except Exception:
+        return "mailjet"
+
+
+def _send_via_mailjet(to_email, subject, body):
     api_key = st.secrets["mailjet"]["api_key"]
     api_secret = st.secrets["mailjet"]["api_secret"]
     sender = st.secrets["mailjet"]["sender"]
@@ -488,31 +507,71 @@ def send_email_mailjet(to_email, subject, body):
     data = {
         'Messages': [
             {
-                "From": {
-                    "Email": sender,
-                    "Name": "GU-TAP System"
-                },
-                "To": [
-                    {
-                        "Email": to_email,
-                        "Name": to_email.split("@")[0]
-                    }
-                ],
+                "From": {"Email": sender, "Name": EMAIL_SENDER_NAME},
+                "To": [{"Email": to_email, "Name": to_email.split("@")[0]}],
                 "Subject": subject,
-                "TextPart": body
+                "TextPart": body,
             }
         ]
     }
 
+    result = mailjet.send.create(data=data)
+    if result.status_code == 200:
+        return True
+    st.warning(f"❌ Failed to email {to_email}: Status {result.status_code}")
+    return False
+
+
+def _send_via_gmail_smtp(to_email, subject, body):
+    """
+    Send through Google's own servers as a georgetown.edu account.
+
+    Google signs the message with the sending domain's DKIM key, so no DNS records
+    are needed on our side. Expected secrets:
+
+        [gmail]
+        user = "gutap@georgetown.edu"
+        app_password = "xxxxxxxxxxxxxxxx"   # 16-char app password, 2-Step Verification on
+        host = "smtp.gmail.com"             # optional; "smtp-relay.gmail.com" for the relay
+        port = 587                          # optional
+        reply_to = "gutap@georgetown.edu"   # optional
+    """
+    conf = st.secrets["gmail"]
+    user = str(conf["user"]).strip()
+    password = str(conf["app_password"]).strip().replace(" ", "")
+    host = str(conf.get("host", "smtp.gmail.com")).strip()
+    port = int(conf.get("port", 587))
+    reply_to = str(conf.get("reply_to", "") or "").strip()
+
+    msg = EmailMessage()
+    msg["From"] = f"{EMAIL_SENDER_NAME} <{user}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    msg.set_content(body)
+
+    with smtplib.SMTP(host, port, timeout=30) as server:
+        server.starttls()
+        server.login(user, password)
+        server.send_message(msg)
+    return True
+
+
+def send_email_mailjet(to_email, subject, body):
+    """
+    Send one email and return True on success.
+
+    Name kept for backwards compatibility - every call site in this file goes through
+    here, so switching providers is a secrets change, not a code change. The actual
+    backend is chosen by [email] transport in secrets.
+    """
     try:
-        result = mailjet.send.create(data=data)
-        if result.status_code == 200:
-            return True
-        else:
-            st.warning(f"❌ Failed to email {to_email}: Status {result.status_code}")
-            return False
+        if _email_transport() == "gmail":
+            return _send_via_gmail_smtp(to_email, subject, body)
+        return _send_via_mailjet(to_email, subject, body)
     except Exception as e:
-        st.error(f"❗ Mailjet error: {e}")
+        st.error(f"❗ Email error ({_email_transport()}): {e}")
         return False
 
 # Research assistant roster (email only; all RAs are notified for new requests)
@@ -3243,15 +3302,14 @@ def _dedup_date(val):
     return _dedup_text(s)
 
 
-def dedupe_log_sheet(df_log, keys, date_col=None, doc_col="Document"):
+def dedupe_log_sheet(df_log, keys, date_col=None):
     """
-    Remove duplicate log rows, keeping the most recent submission of each group.
+    Remove duplicate log rows, always keeping the LAST (most recent) submission.
 
     Rows match when every key field is equal after normalization (whitespace collapsed,
-    case-insensitive, dates compared as calendar dates). Within a duplicate group the
-    survivor is the LAST row that carries a Document link; if none of them do, it is
-    simply the last row. This keeps an uploaded attachment from being dropped when
-    someone re-submits the same entry without re-attaching the file.
+    case-insensitive, dates compared as calendar dates). The Document column is
+    deliberately NOT considered: a re-upload produces a different Drive link every time,
+    so comparing or preferring on it prevents genuine duplicates from collapsing.
 
     Rows whose key fields are all blank are never treated as duplicates of one another.
 
@@ -3263,10 +3321,6 @@ def dedupe_log_sheet(df_log, keys, date_col=None, doc_col="Document"):
     present_keys = [k for k in keys if k in df_log.columns]
     if not present_keys:
         return df_log, 0
-
-    has_doc = None
-    if doc_col in df_log.columns:
-        has_doc = [bool(_dedup_text(v)) for v in df_log[doc_col].tolist()]
 
     keep_positions = []
     groups = {}
@@ -3282,13 +3336,9 @@ def dedupe_log_sheet(df_log, keys, date_col=None, doc_col="Document"):
             continue
         groups.setdefault(key, []).append(pos)
 
+    # Last submission wins, unconditionally.
     for positions in groups.values():
-        chosen = positions[-1]
-        if has_doc is not None:
-            with_doc = [p for p in positions if has_doc[p]]
-            if with_doc:
-                chosen = with_doc[-1]
-        keep_positions.append(chosen)
+        keep_positions.append(positions[-1])
 
     keep_positions = sorted(set(keep_positions))
     removed = len(df_log) - len(keep_positions)
