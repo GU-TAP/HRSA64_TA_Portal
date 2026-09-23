@@ -478,6 +478,26 @@ creds_json = json.dumps(credentials)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
 client = gspread.authorize(creds)
 
+MAIN_SPREADSHEET = 'HRSA64_TA_Request'
+
+
+@st.cache_resource(ttl=3600)
+def get_spreadsheet(name=MAIN_SPREADSHEET):
+    """
+    Cached gspread Spreadsheet handle.
+
+    client.open() looks the file up by title on every call, which costs an API request
+    each time. The whole app talks to one spreadsheet, so the handle is opened once per
+    hour and reused. This is the single biggest source of Sheets read-quota usage.
+    """
+    return client.open(name)
+
+
+def _is_quota_error(exc) -> bool:
+    """True for 429 / rate-limit style API errors, which are worth waiting out."""
+    text = str(exc)
+    return ('429' in text) or ('Quota exceeded' in text) or ('RESOURCE_EXHAUSTED' in text)
+
 
 EMAIL_SENDER_NAME = "GU-TAP System"
 
@@ -799,10 +819,10 @@ GU-TAP System
     if sheet_updated:
         try:
             df_out = df.fillna("")
-            spreadsheet_support = client.open("HRSA64_TA_Request")
+            spreadsheet_support = get_spreadsheet()
             worksheet_support = spreadsheet_support.worksheet("GA_Support")
             worksheet_support.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-            st.cache_data.clear()
+            load_support_sheet.clear()  # only the sheet just written, not every cached loader
         except Exception:
             pass
 
@@ -2467,13 +2487,13 @@ def process_travel_review_escalations(df_travel, client):
 
     df = df.fillna('')
     try:
-        spreadsheet_travel = client.open('HRSA64_TA_Request')
+        spreadsheet_travel = get_spreadsheet()
         try:
             worksheet_travel = spreadsheet_travel.worksheet('Travel')
         except Exception:
             worksheet_travel = spreadsheet_travel.add_worksheet(title='Travel', rows=1000, cols=40)
         worksheet_travel.update([df.columns.values.tolist()] + df.values.tolist())
-        st.cache_data.clear()
+        load_travel_sheet.clear()  # only the sheet just written, not every cached loader
     except Exception:
         pass
 
@@ -3194,21 +3214,28 @@ def regenerate_gsa_pdf_to_drive(pdf_link, row_dict, creds_dict, folder_id_pdf):
     return False, new_url
 
 
-def _get_records_with_retry(spreadsheet_name, worksheet_name, retries=3, base_delay=0.5):
-    """Fetch worksheet records with simple exponential backoff to mitigate 429s."""
+def _get_records_with_retry(spreadsheet_name, worksheet_name, retries=3, base_delay=5):
+    """
+    Fetch worksheet records, backing off on quota errors.
+
+    Sheets quota is 60 reads/minute per user and refills on a one-minute window, so a
+    sub-second retry just burns another request. Only quota errors are retried, and the
+    delay grows 5s -> 10s -> 20s. Any other failure (bad sheet name, auth, network) is
+    raised immediately instead of being retried three times for nothing.
+    """
     attempt = 0
     last_exc = None
     while attempt < retries:
         try:
-            spreadsheet = client.open(spreadsheet_name)
+            spreadsheet = get_spreadsheet(spreadsheet_name)
             worksheet = spreadsheet.worksheet(worksheet_name)
             return worksheet.get_all_records()
         except Exception as exc:
             last_exc = exc
-            delay = base_delay * (2 ** attempt)
-            time.sleep(delay)
+            if not _is_quota_error(exc):
+                raise
+            time.sleep(base_delay * (2 ** attempt))
             attempt += 1
-    # If all retries failed, re-raise last exception
     raise last_exc
 
 @st.cache_data(ttl=600)
@@ -3464,10 +3491,10 @@ GU-TAP
     if sheet_updated:
         try:
             df_out = df.fillna('')
-            spreadsheet_gsa = client.open('HRSA64_TA_Request')
+            spreadsheet_gsa = get_spreadsheet()
             worksheet_gsa = spreadsheet_gsa.worksheet('GSA_exemption')
             worksheet_gsa.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-            st.cache_data.clear()
+            load_gsa_exemption_sheet.clear()  # only the sheet just written, not every cached loader
         except Exception:
             pass
 
@@ -3603,12 +3630,41 @@ GU-TAP System
     if sheet_updated:
         try:
             df_out = df_due.fillna('')
-            spreadsheet_main = client.open('HRSA64_TA_Request')
+            spreadsheet_main = get_spreadsheet()
             worksheet_main = spreadsheet_main.worksheet('Main')
             worksheet_main.update([df_out.columns.values.tolist()] + df_out.values.tolist())
-            st.cache_data.clear()
+            load_main_sheet.clear()  # only the sheet just written, not every cached loader
         except Exception:
             pass
+
+
+REMINDER_SWEEP_FLAG = '_reminder_sweeps_done'
+
+
+def run_reminder_sweeps():
+    """
+    Run the three reminder sweeps at most once per session.
+
+    Streamlit re-executes the whole script on every widget interaction, and each sweep
+    reads a full worksheet directly (bypassing the cached loaders). Running them on
+    every rerun burned ~9 Sheets read requests per click against a 60/minute quota that
+    all users share. Once per session is enough: each sweep already records what it has
+    sent, so nothing is missed by not re-checking on every click.
+    """
+    if st.session_state.get(REMINDER_SWEEP_FLAG):
+        return
+    st.session_state[REMINDER_SWEEP_FLAG] = True
+    for sweep in (
+        maybe_send_ga_unassigned_reminders,
+        maybe_send_gsa_exemption_reminders,
+        maybe_send_ta_due_date_reminders,
+    ):
+        try:
+            sweep()
+        except Exception:
+            # A reminder sweep must never stop someone using the dashboard.
+            pass
+
 
 
 df_travel = load_travel_sheet()
@@ -3992,12 +4048,12 @@ else:
                     )
                     # Replace NaN with empty strings to ensure JSON compatibility
                     updated_sheet = updated_sheet.fillna("")
-                    spreadsheet1 = client.open('HRSA64_TA_Request')
+                    spreadsheet1 = get_spreadsheet()
                     worksheet1 = spreadsheet1.worksheet('Main')
                     worksheet1.update([updated_sheet.columns.values.tolist()] + updated_sheet.values.tolist())
                     
                     # Clear cache to refresh data
-                    st.cache_data.clear()
+                    load_main_sheet.clear()  # only the sheet just written, not every cached loader
                     
                     # Send email notifications to all coordinators
                     coordinator_emails = [coord_email for coord_email, user in USERS.items() if "Coordinator" in user]
@@ -4128,9 +4184,7 @@ else:
                     st.error("Invalid credentials or role mismatch.")
 
         else:
-            maybe_send_ga_unassigned_reminders()
-            maybe_send_gsa_exemption_reminders()
-            maybe_send_ta_due_date_reminders()
+            run_reminder_sweeps()
             if st.session_state.role == "Coordinator":
                 user_info = USERS.get(st.session_state.user_email)
                 coordinator_name = user_info["Coordinator"]["name"]
@@ -4357,14 +4411,14 @@ else:
                                         lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (pd.Timestamp, datetime)) and not pd.isna(x) else x
                                     )
                                     updated_df = updated_df.fillna("") 
-                                    spreadsheet1 = client.open('HRSA64_TA_Request')
+                                    spreadsheet1 = get_spreadsheet()
                                     worksheet1 = spreadsheet1.worksheet('Main')
 
                                     # Push to Google Sheet
                                     worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
 
                                     # Clear cache to refresh data
-                                    st.cache_data.clear()
+                                    load_main_sheet.clear()  # only the sheet just written, not every cached loader
                                     
                                     st.success(f"Coach {selected_coach} assigned! Status updated to 'In Progress'.")
 
@@ -4513,11 +4567,11 @@ else:
                                         )
                                         updated_df = updated_df.fillna("")
 
-                                        spreadsheet1 = client.open('HRSA64_TA_Request')
+                                        spreadsheet1 = get_spreadsheet()
                                         worksheet1 = spreadsheet1.worksheet('Main')
                                         worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
 
-                                        st.cache_data.clear()
+                                        load_main_sheet.clear()  # only the sheet just written, not every cached loader
 
                                         st.success(f"Request {updated_df.loc[selected_transfer_index, 'Ticket ID']} transferred from {old_coach or 'N/A'} to {new_coach}.")
 
@@ -4716,12 +4770,12 @@ else:
 
 
                                     # Push to Google Sheets
-                                    spreadsheet1 = client.open('HRSA64_TA_Request')
+                                    spreadsheet1 = get_spreadsheet()
                                     worksheet1 = spreadsheet1.worksheet('Main')
                                     worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
 
                                     # Clear cache to refresh data
-                                    st.cache_data.clear()
+                                    load_main_sheet.clear()  # only the sheet just written, not every cached loader
                                     
                                     st.success("💬 Comment saved successfully!.")
                                     time.sleep(2)
@@ -5061,7 +5115,7 @@ else:
                                     )
                                     # Replace NaN with empty strings to ensure JSON compatibility
                                     updated_sheet1 = updated_sheet1.fillna("")
-                                    spreadsheet2 = client.open('HRSA64_TA_Request')
+                                    spreadsheet2 = get_spreadsheet()
                                     # Auto-remove earlier duplicates of this entry before writing back.
                                     updated_sheet1, _dupes_removed = dedupe_log_sheet(
                                         updated_sheet1, INTERACTION_DEDUP_KEYS, date_col="Date of Interaction"
@@ -5071,7 +5125,7 @@ else:
                                     worksheet2.update([updated_sheet1.columns.values.tolist()] + updated_sheet1.values.tolist())
 
                                     # Clear cache to refresh data
-                                    st.cache_data.clear()
+                                    load_interaction_sheet.clear()  # only the sheet just written, not every cached loader
 
                                     if len(new_data_int) > 1:
                                         st.success(f"✅ Submission successful! {len(new_data_int)} rows logged (one per jurisdiction).")
@@ -5201,7 +5255,7 @@ else:
                                     )
                                     # Replace NaN with empty strings to ensure JSON compatibility
                                     updated_sheet2 = updated_sheet2.fillna("")
-                                    spreadsheet3 = client.open('HRSA64_TA_Request')
+                                    spreadsheet3 = get_spreadsheet()
                                     # Auto-remove earlier duplicates of this entry before writing back.
                                     updated_sheet2, _dupes_removed = dedupe_log_sheet(
                                         updated_sheet2, DELIVERY_DEDUP_KEYS, date_col="Date of Delivery"
@@ -5211,7 +5265,7 @@ else:
                                     worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
 
                                     # Clear cache to refresh data
-                                    st.cache_data.clear()
+                                    load_delivery_sheet.clear()  # only the sheet just written, not every cached loader
                                     
                                     st.success("✅ Submission successful!")
                                     time.sleep(2)
@@ -5472,7 +5526,7 @@ else:
                                                     upd = fresh_tr.copy()
                                                     upd.loc[selected_form_idx, 'PDF Link'] = out_url
                                                     upd = upd.fillna("")
-                                                    spreadsheet_travel = client.open('HRSA64_TA_Request')
+                                                    spreadsheet_travel = get_spreadsheet()
                                                     try:
                                                         worksheet_travel = spreadsheet_travel.worksheet('Travel')
                                                     except Exception:
@@ -5487,7 +5541,7 @@ else:
                                                     if inplace_ok
                                                     else "New PDF uploaded; PDF Link in the sheet was updated."
                                                 )
-                                                st.cache_data.clear()
+                                                load_travel_sheet.clear()  # only the sheet just written, not every cached loader
                                                 time.sleep(1)
                                                 st.rerun()
                                         except Exception as e:
@@ -5585,7 +5639,7 @@ else:
                                                     updated_df_travel.loc[selected_form_idx, signature_col] = coordinator_signature_text
                                                     
                                                     updated_df_travel = updated_df_travel.fillna("")
-                                                    spreadsheet_travel = client.open('HRSA64_TA_Request')
+                                                    spreadsheet_travel = get_spreadsheet()
                                                     try:
                                                         worksheet_travel = spreadsheet_travel.worksheet('Travel')
                                                     except:
@@ -5958,7 +6012,7 @@ GU-TAP System
                                                             updated_df_travel.loc[selected_form_idx, other_sig_col] = ''
                                                     
                                                     updated_df_travel = updated_df_travel.fillna("")
-                                                    spreadsheet_travel = client.open('HRSA64_TA_Request')
+                                                    spreadsheet_travel = get_spreadsheet()
                                                     try:
                                                         worksheet_travel = spreadsheet_travel.worksheet('Travel')
                                                     except:
@@ -6103,7 +6157,7 @@ GU-TAP System
                                                 upd = fresh_tr.copy()
                                                 upd.loc[_pick_regen, 'PDF Link'] = out_url
                                                 upd = upd.fillna("")
-                                                spreadsheet_travel = client.open('HRSA64_TA_Request')
+                                                spreadsheet_travel = get_spreadsheet()
                                                 try:
                                                     worksheet_travel = spreadsheet_travel.worksheet('Travel')
                                                 except Exception:
@@ -6118,7 +6172,7 @@ GU-TAP System
                                                 if inplace_ok
                                                 else "New PDF uploaded; PDF Link in the sheet was updated."
                                             )
-                                            st.cache_data.clear()
+                                            load_travel_sheet.clear()  # only the sheet just written, not every cached loader
                                             time.sleep(1)
                                             st.rerun()
                                     except Exception as e:
@@ -6232,7 +6286,7 @@ GU-TAP System
                                                         upd.loc[_pick_ro, "PDF Link"] = out_url
                                                         upd = upd.fillna("")
                                                         upd = reorder_gsa_exemption_dataframe(upd)
-                                                        spreadsheet_gsa = client.open("HRSA64_TA_Request")
+                                                        spreadsheet_gsa = get_spreadsheet()
                                                         try:
                                                             ws_gsa = spreadsheet_gsa.worksheet("GSA_exemption")
                                                         except Exception:
@@ -6247,7 +6301,7 @@ GU-TAP System
                                                         if inplace_ok
                                                         else "New PDF uploaded; PDF Link in the sheet was updated."
                                                     )
-                                                    st.cache_data.clear()
+                                                    load_gsa_exemption_sheet.clear()  # only the sheet just written, not every cached loader
                                                     time.sleep(1)
                                                     st.rerun()
                                             except Exception as e:
@@ -6334,7 +6388,7 @@ GU-TAP System
                                                             upd.loc[_pick_np, "PDF Link"] = out_url
                                                             upd = upd.fillna("")
                                                             upd = reorder_gsa_exemption_dataframe(upd)
-                                                            spreadsheet_gsa = client.open("HRSA64_TA_Request")
+                                                            spreadsheet_gsa = get_spreadsheet()
                                                             try:
                                                                 ws_gsa = spreadsheet_gsa.worksheet("GSA_exemption")
                                                             except Exception:
@@ -6349,7 +6403,7 @@ GU-TAP System
                                                             if inplace_ok
                                                             else "New PDF uploaded; PDF Link in the sheet was updated."
                                                         )
-                                                        st.cache_data.clear()
+                                                        load_gsa_exemption_sheet.clear()  # only the sheet just written, not every cached loader
                                                         time.sleep(1)
                                                         st.rerun()
                                                 except Exception as e:
@@ -6418,7 +6472,7 @@ GU-TAP System
                                                         upd.loc[selected_gsa_idx, "PDF Link"] = out_url
                                                         upd = upd.fillna("")
                                                         upd = reorder_gsa_exemption_dataframe(upd)
-                                                        spreadsheet_gsa = client.open("HRSA64_TA_Request")
+                                                        spreadsheet_gsa = get_spreadsheet()
                                                         try:
                                                             ws_gsa = spreadsheet_gsa.worksheet("GSA_exemption")
                                                         except Exception:
@@ -6433,7 +6487,7 @@ GU-TAP System
                                                         if inplace_ok
                                                         else "New PDF uploaded; PDF Link in the sheet was updated."
                                                     )
-                                                    st.cache_data.clear()
+                                                    load_gsa_exemption_sheet.clear()  # only the sheet just written, not every cached loader
                                                     time.sleep(1)
                                                     st.rerun()
                                             except Exception as e:
@@ -6496,7 +6550,7 @@ GU-TAP System
                                                     updated_gsa = updated_gsa.fillna("")
                                                     updated_gsa = reorder_gsa_exemption_dataframe(updated_gsa)
 
-                                                    spreadsheet_gsa = client.open('HRSA64_TA_Request')
+                                                    spreadsheet_gsa = get_spreadsheet()
                                                     try:
                                                         ws_gsa = spreadsheet_gsa.worksheet('GSA_exemption')
                                                     except Exception:
@@ -6660,7 +6714,7 @@ GU-TAP System
 
                                                         updated_gsa = updated_gsa.fillna("")
                                                         updated_gsa = reorder_gsa_exemption_dataframe(updated_gsa)
-                                                        spreadsheet_gsa = client.open('HRSA64_TA_Request')
+                                                        spreadsheet_gsa = get_spreadsheet()
                                                         try:
                                                             ws_gsa = spreadsheet_gsa.worksheet('GSA_exemption')
                                                         except Exception:
@@ -7008,11 +7062,11 @@ GU-TAP System
                                 updated_df = updated_df.fillna("") 
 
                                 # Push to Google Sheets
-                                spreadsheet1 = client.open('HRSA64_TA_Request')
+                                spreadsheet1 = get_spreadsheet()
                                 worksheet1 = spreadsheet1.worksheet('Main')
                                 worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
 
-                                st.cache_data.clear()
+                                load_main_sheet.clear()  # only the sheet just written, not every cached loader
 
                                 st.success("💬 Comment saved successfully!.")
                                 time.sleep(2)
@@ -7310,7 +7364,7 @@ GU-TAP System
                                 updated_sheet2 = updated_sheet2.fillna("")
                                 
                                 # Get the worksheet first
-                                spreadsheet3 = client.open('HRSA64_TA_Request')
+                                spreadsheet3 = get_spreadsheet()
                                 # Auto-remove earlier duplicates of this entry before writing back.
                                 updated_sheet2, _dupes_removed = dedupe_log_sheet(
                                     updated_sheet2, INTERACTION_DEDUP_KEYS, date_col="Date of Interaction"
@@ -7320,7 +7374,7 @@ GU-TAP System
                                 worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
 
                                 # Clear cache to refresh data
-                                st.cache_data.clear()
+                                load_interaction_sheet.clear()  # only the sheet just written, not every cached loader
 
                                 if len(new_data_int) > 1:
                                     st.success(f"✅ Submission successful! {len(new_data_int)} rows logged (one per jurisdiction).")
@@ -7614,12 +7668,12 @@ GU-TAP System
                                 )
                                 # Replace NaN with empty strings to ensure JSON compatibility
                                 updated_sheet3 = updated_sheet3.fillna("")
-                                spreadsheet4 = client.open('HRSA64_TA_Request')
+                                spreadsheet4 = get_spreadsheet()
                                 worksheet4 = spreadsheet4.worksheet('GA_Support')
                                 worksheet4.update([updated_sheet3.columns.values.tolist()] + updated_sheet3.values.tolist())
 
                                 # Clear cache to refresh data
-                                st.cache_data.clear()
+                                load_support_sheet.clear()  # only the sheet just written, not every cached loader
                                 
                                 st.success("✅ Submission successful!")
                                 
@@ -8337,7 +8391,7 @@ GU-TAP System
                                     updated_travel_sheet = updated_travel_sheet.fillna("")
                                     
                                     # Update Google Sheet
-                                    spreadsheet_travel = client.open('HRSA64_TA_Request')
+                                    spreadsheet_travel = get_spreadsheet()
                                     try:
                                         worksheet_travel = spreadsheet_travel.worksheet('Travel')
                                     except:
@@ -8347,7 +8401,7 @@ GU-TAP System
                                     worksheet_travel.update([updated_travel_sheet.columns.values.tolist()] + updated_travel_sheet.values.tolist())
                                     
                                     # Clear cache to refresh data
-                                    st.cache_data.clear()
+                                    load_travel_sheet.clear()  # only the sheet just written, not every cached loader
                                     
                                     st.success("Saved.")
                                     
@@ -8430,7 +8484,7 @@ GU-TAP System
                                         updated_df_travel.loc[row_idx, approver2_status_col] = 'pending'
                                         
                                         updated_df_travel = updated_df_travel.fillna("")
-                                        spreadsheet_travel = client.open('HRSA64_TA_Request')
+                                        spreadsheet_travel = get_spreadsheet()
                                         try:
                                             worksheet_travel = spreadsheet_travel.worksheet('Travel')
                                         except:
@@ -8763,7 +8817,7 @@ GU-TAP System
                                 )
                                 # Replace NaN with empty strings to ensure JSON compatibility
                                 updated_sheet2 = updated_sheet2.fillna("")
-                                spreadsheet3 = client.open('HRSA64_TA_Request')
+                                spreadsheet3 = get_spreadsheet()
                                 # Auto-remove earlier duplicates of this entry before writing back.
                                 updated_sheet2, _dupes_removed = dedupe_log_sheet(
                                     updated_sheet2, DELIVERY_DEDUP_KEYS, date_col="Date of Delivery"
@@ -8773,7 +8827,7 @@ GU-TAP System
                                 worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
 
                                 # Clear cache to refresh data
-                                st.cache_data.clear()
+                                load_delivery_sheet.clear()  # only the sheet just written, not every cached loader
                                 
                                 st.success("✅ Submission successful!")
                                 time.sleep(2)
@@ -8960,7 +9014,7 @@ GU-TAP System
                                         merged_gsa = pd.concat([df_gsa_save, pd.DataFrame([new_gsa_row])], ignore_index=True)
                                     merged_gsa = merged_gsa.fillna("")
                                     merged_gsa = reorder_gsa_exemption_dataframe(merged_gsa)
-                                    spreadsheet_gsa = client.open('HRSA64_TA_Request')
+                                    spreadsheet_gsa = get_spreadsheet()
                                     try:
                                         ws_gsa_save = spreadsheet_gsa.worksheet('GSA_exemption')
                                     except Exception:
@@ -8970,7 +9024,7 @@ GU-TAP System
                                             cols=len(gsa_exemption_full_column_order()) + 5,
                                         )
                                     ws_gsa_save.update([merged_gsa.columns.values.tolist()] + merged_gsa.values.tolist())
-                                    st.cache_data.clear()
+                                    load_gsa_exemption_sheet.clear()  # only the sheet just written, not every cached loader
                                     st.success("✅ GSA exemption form saved to Google Sheets.")
                                 except Exception as e:
                                     st.warning(f"⚠️ Error saving to Google Sheets: {str(e)}")
@@ -9027,7 +9081,7 @@ GU-TAP System
                                             updated_df.loc[row_idx, c2] = 'pending'
                                             updated_df = updated_df.fillna("")
                                             updated_df = reorder_gsa_exemption_dataframe(updated_df)
-                                            spreadsheet_gsa = client.open('HRSA64_TA_Request')
+                                            spreadsheet_gsa = get_spreadsheet()
                                             try:
                                                 ws_u = spreadsheet_gsa.worksheet('GSA_exemption')
                                             except Exception:
@@ -9147,14 +9201,14 @@ GU-TAP System
                                     lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (pd.Timestamp, datetime)) and not pd.isna(x) else x
                                 )
                                 updated_df = updated_df.fillna("") 
-                                spreadsheet1 = client.open('HRSA64_TA_Request')
+                                spreadsheet1 = get_spreadsheet()
                                 worksheet1 = spreadsheet1.worksheet('Main')
 
                                 # Push to Google Sheet
                                 worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
 
                                 # Clear cache to refresh data
-                                st.cache_data.clear()
+                                load_main_sheet.clear()  # only the sheet just written, not every cached loader
                                 
                                 st.success("✅ Request marked as completed.")
                                 time.sleep(2)
@@ -9461,11 +9515,11 @@ GU-TAP System
 
                                     # Update Google Sheet
                                     updated_df_support = updated_df_support.fillna("")
-                                    spreadsheet_support = client.open('HRSA64_TA_Request')
+                                    spreadsheet_support = get_spreadsheet()
                                     worksheet_support = spreadsheet_support.worksheet('GA_Support')
                                     worksheet_support.update([updated_df_support.columns.values.tolist()] + updated_df_support.values.tolist())
 
-                                    st.cache_data.clear()
+                                    load_support_sheet.clear()  # only the sheet just written, not every cached loader
                                     st.success(f"Request assigned to you with status 'Not Started'!")
                                     
                                     # Send notification email to TAP
@@ -9582,11 +9636,11 @@ GU-TAP System
 
                                         # Update Google Sheet
                                         updated_df_support = updated_df_support.fillna("")
-                                        spreadsheet_support = client.open('HRSA64_TA_Request')
+                                        spreadsheet_support = get_spreadsheet()
                                         worksheet_support = spreadsheet_support.worksheet('GA_Support')
                                         worksheet_support.update([updated_df_support.columns.values.tolist()] + updated_df_support.values.tolist())
 
-                                        st.cache_data.clear()
+                                        load_support_sheet.clear()  # only the sheet just written, not every cached loader
                                         st.success("Request marked as 'In Progress'!")
                                         
                                         # Send status update email to TAP
@@ -9643,11 +9697,11 @@ GU-TAP System
 
                                     # Update Google Sheet
                                     updated_df_support = updated_df_support.fillna("")
-                                    spreadsheet_support = client.open('HRSA64_TA_Request')
+                                    spreadsheet_support = get_spreadsheet()
                                     worksheet_support = spreadsheet_support.worksheet('GA_Support')
                                     worksheet_support.update([updated_df_support.columns.values.tolist()] + updated_df_support.values.tolist())
 
-                                    st.cache_data.clear()
+                                    load_support_sheet.clear()  # only the sheet just written, not every cached loader
                                     st.success("Request marked as 'Completed'!")
                                     
                                     # Send completion email to TAP
@@ -9773,11 +9827,11 @@ GU-TAP System
                                 
                                 # Update Google Sheet
                                 updated_df_support = updated_df_support.fillna("")
-                                spreadsheet_support = client.open('HRSA64_TA_Request')
+                                spreadsheet_support = get_spreadsheet()
                                 worksheet_support = spreadsheet_support.worksheet('GA_Support')
                                 worksheet_support.update([updated_df_support.columns.values.tolist()] + updated_df_support.values.tolist())
 
-                                st.cache_data.clear()
+                                load_support_sheet.clear()  # only the sheet just written, not every cached loader
                                 st.success("✅ Request has been re-assigned! The supporter field has been cleared.")
                                 
                                 # Send notifications to ALL Research Assistants
@@ -10101,12 +10155,12 @@ GU-TAP System
                                             ra_updated_int, INTERACTION_DEDUP_KEYS, date_col="Date of Interaction"
                                         )
                                         _report_dedup(_dupes_removed, "interaction")
-                                        ra_ws_int = client.open("HRSA64_TA_Request").worksheet("Interaction")
+                                        ra_ws_int = get_spreadsheet().worksheet("Interaction")
                                         ra_ws_int.update(
                                             [ra_updated_int.columns.values.tolist()]
                                             + ra_updated_int.values.tolist()
                                         )
-                                        st.cache_data.clear()
+                                        load_interaction_sheet.clear()  # only the sheet just written, not every cached loader
                                         st.success(
                                             f"✅ Logged {len(ra_rows_int)} interaction row(s) for {ra_provider}."
                                         )
@@ -10204,12 +10258,12 @@ GU-TAP System
                                             ra_updated_del, DELIVERY_DEDUP_KEYS, date_col="Date of Delivery"
                                         )
                                         _report_dedup(_dupes_removed, "delivery")
-                                        ra_ws_del = client.open("HRSA64_TA_Request").worksheet("Delivery")
+                                        ra_ws_del = get_spreadsheet().worksheet("Delivery")
                                         ra_ws_del.update(
                                             [ra_updated_del.columns.values.tolist()]
                                             + ra_updated_del.values.tolist()
                                         )
-                                        st.cache_data.clear()
+                                        load_delivery_sheet.clear()  # only the sheet just written, not every cached loader
                                         st.success(f"✅ Logged delivery for {ra_provider}.")
                                         time.sleep(2)
                                         st.rerun()
