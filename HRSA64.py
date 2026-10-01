@@ -478,6 +478,50 @@ creds_json = json.dumps(credentials)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
 client = gspread.authorize(creds)
 
+# --- Drive / URL columns in tables ------------------------------------------------------
+# st.dataframe renders a long URL as truncated plain text, so links were neither
+# clickable nor fully copyable. These columns are rendered as real links instead.
+LINK_COLUMN_NAMES = (
+    "PDF Link", "Document", "Documents", "Support Files",
+    "Supporting Material(s)", "Supporting Materials", "Drive Link", "File Link",
+)
+
+
+def link_column_config(df_show):
+    """Column config that turns Drive/URL columns into clickable, full-width links."""
+    cfg = {}
+    try:
+        columns = list(df_show.columns)
+    except Exception:
+        return cfg
+    for col in columns:
+        name = str(col)
+        if name not in LINK_COLUMN_NAMES and not name.lower().endswith(" link"):
+            continue
+        try:
+            values = df_show[col].astype(str)
+            most_links = int(values.str.count(r"https?://").max() or 0)
+        except Exception:
+            most_links = 0
+        if most_links > 1:
+            # Several Drive links in one cell: LinkColumn can only render one, so show
+            # the full text rather than a truncated preview.
+            cfg[name] = st.column_config.TextColumn(name, width="large")
+        else:
+            cfg[name] = st.column_config.LinkColumn(name, width="large")
+    return cfg
+
+
+def show_df(data, **kwargs):
+    """st.dataframe, with Drive/URL columns shown as complete clickable links."""
+    if isinstance(data, pd.DataFrame) and "column_config" not in kwargs:
+        cfg = link_column_config(data)
+        if cfg:
+            kwargs["column_config"] = cfg
+    kwargs.setdefault("use_container_width", True)
+    return st.dataframe(data, **kwargs)
+
+
 MAIN_SPREADSHEET = 'HRSA64_TA_Request'
 
 
@@ -3415,6 +3459,18 @@ def gsa_row_still_pending_approval(row):
     )
 
 
+# GSA Lodging Exemption needs both signatures (Jen Approval Status + Kemisha Approval Status) and no rejection.
+GSA_APPROVER_STATUS_COLS = ('Jen Approval Status', 'Kemisha Approval Status')
+
+
+def gsa_row_fully_approved(row):
+    """True when every GSA approver has signed off and nobody rejected."""
+    values = [_travel_approval_status_norm(row.get(c)) for c in GSA_APPROVER_STATUS_COLS]
+    if any(_travel_approval_is_reject(v) for v in values):
+        return False
+    return bool(values) and all(v == 'approve' for v in values)
+
+
 def maybe_send_gsa_exemption_reminders():
     """Email Jen and Kemisha when a GSA exemption is pending approval for more than GSA_REMINDER_DAYS. At most once per request per calendar day (tracked in GSA Reminder Last Sent)."""
     today = datetime.today().date()
@@ -4333,7 +4389,7 @@ else:
                         # Format dates for display
                         staff_dfff["Targeted Due Date"] = staff_dfff["Targeted Due Date"].dt.strftime("%Y-%m-%d")
 
-                        st.dataframe(staff_dfff[display_cols].reset_index(drop=True))
+                        show_df(staff_dfff[display_cols].reset_index(drop=True))
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
                     with st.expander("📝 **ASSIGN TA REQUESTS**"):
@@ -4376,7 +4432,7 @@ else:
                             )
 
                             # Display clean table (exclude PriorityOrder column)
-                            st.dataframe(submitted_requests_sorted[[
+                            show_df(submitted_requests_sorted[[
                                 "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
                                 "Focus Area", "TA Type", "Submit Date", "Targeted Due Date", "Priority", "TA Description","Document"
                             ]].reset_index(drop=True))
@@ -4727,7 +4783,7 @@ else:
                             ]
 
                             # Display filtered table
-                            st.dataframe(filtered_df[[
+                            show_df(filtered_df[[
                                 "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
                                 "Focus Area", "TA Type", "Assigned Date", "Targeted Due Date","Expected Duration (Days)","Priority",
                                 "Assigned Coach", "TA Description","Document","Coordinator Comment History"
@@ -4838,7 +4894,7 @@ else:
                             ]
 
                             # Display filtered table
-                            st.dataframe(filtered_df1[[
+                            show_df(filtered_df1[[
                                 "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
                                 "Focus Area", "TA Type", "Priority", "Assigned Coach", "TA Description","Document","Assigned Date",
                                 "Targeted Due Date", "Close Date", "Expected Duration (Days)",
@@ -4898,7 +4954,7 @@ else:
                                 </div>
                             """, unsafe_allow_html=True)
 
-                            st.dataframe(df_int_coord_display.reset_index(drop=True), use_container_width=True)
+                            show_df(df_int_coord_display.reset_index(drop=True), use_container_width=True)
                             
                         else:
                             st.markdown("""
@@ -4950,7 +5006,7 @@ else:
                                     df_ticket_int_display["Date of Interaction"] = df_ticket_int_display["Date of Interaction"].dt.strftime("%Y-%m-%d")
                                     
                                     st.markdown(f"**All interactions for Ticket ID: {selected_ticket_view}**")
-                                    st.dataframe(df_ticket_int_display.reset_index(drop=True), use_container_width=True)
+                                    show_df(df_ticket_int_display.reset_index(drop=True), use_container_width=True)
                                 else:
                                     st.info(f"No interactions found for Ticket ID: {selected_ticket_view}")
                         else:
@@ -5457,7 +5513,7 @@ else:
                                 available_cols = [col for col in display_cols if col in pending_forms.columns]
                                 
                                 pending_display = pending_forms[available_cols].copy()
-                                st.dataframe(pending_display.reset_index(drop=True), use_container_width=True)
+                                show_df(pending_display.reset_index(drop=True), use_container_width=True)
                                 
                                 # Select form to review
                                 form_indices = pending_forms.index.tolist()
@@ -6120,7 +6176,7 @@ GU-TAP System
                                     if col in fully_approved.columns:
                                         approved_display_cols.append(col)
                                 available_approved_cols = [col for col in approved_display_cols if col in fully_approved.columns]
-                                st.dataframe(fully_approved[available_approved_cols].reset_index(drop=True), use_container_width=True)
+                                show_df(fully_approved[available_approved_cols].reset_index(drop=True), use_container_width=True)
                                 st.caption(
                                     "To refresh an older PDF after template changes, regenerate from the sheet row below "
                                     "(replaces the Drive file in place when the PDF Link is recognized)."
@@ -6237,12 +6293,12 @@ GU-TAP System
                                         ]
                                     ]
                                     if display_cols:
-                                        st.dataframe(
+                                        show_df(
                                             df_gsa_review[display_cols].reset_index(drop=True),
                                             use_container_width=True,
                                         )
                                     else:
-                                        st.dataframe(df_gsa_review.reset_index(drop=True), use_container_width=True)
+                                        show_df(df_gsa_review.reset_index(drop=True), use_container_width=True)
                                     folder_id_gsa_pdf_regen = "1_O_L-jPR7bldiryRNB3WxbAaG8VqvmCt"
                                     st.markdown("##### Regenerate GSA PDF from sheet")
                                     st.caption(
@@ -6754,6 +6810,52 @@ GU-TAP System
                                                         st.error(f"Error: {str(e)}")
                         except Exception as e:
                             st.error(f"Error loading GSA exemption forms: {str(e)}")
+                        # --- Approved GSA exemptions: full archive for tracking back ---
+                        st.markdown("---")
+                        st.markdown("#### ✅ Approved GSA Exemption Forms")
+                        try:
+                            df_gsa_all = load_gsa_exemption_sheet()
+                            if df_gsa_all is None or df_gsa_all.empty:
+                                st.info("No GSA exemption forms submitted yet.")
+                            else:
+                                approved_mask_gsa = df_gsa_all.apply(gsa_row_fully_approved, axis=1)
+                                gsa_approved = df_gsa_all[approved_mask_gsa].copy()
+                                if gsa_approved.empty:
+                                    st.info("No fully approved GSA exemption forms yet.")
+                                else:
+                                    st.caption(
+                                        f"{len(gsa_approved)} approved form(s). "
+                                        "Open the PDF Link to download; all approvers can see the full history here."
+                                    )
+                                    gsa_cols_pref = [
+                                        'Requester Name', 'Traveler Name(s)', 'Travel City/State',
+                                        'Dates of Travel', 'Requested Lodfing Rate',
+                                        'GSA-Approved Lodging Rate', 'Submission Date', 'PDF Link',
+                                    ] + list(GSA_APPROVER_STATUS_COLS) + [
+                                        c.replace('Approval Status', 'Approval Date')
+                                        for c in GSA_APPROVER_STATUS_COLS
+                                    ]
+                                    gsa_show_cols = [
+                                        c for c in gsa_cols_pref if c in gsa_approved.columns
+                                    ]
+                                    gsa_view = gsa_approved[gsa_show_cols].copy()
+                                    if 'Submission Date' in gsa_view.columns:
+                                        gsa_view = gsa_view.sort_values(
+                                            'Submission Date', ascending=False
+                                        )
+                                    show_df(gsa_view.reset_index(drop=True))
+                                    st.download_button(
+                                        "⬇️ Download approved GSA list (CSV)",
+                                        data=gsa_view.to_csv(index=False).encode('utf-8'),
+                                        file_name=(
+                                            "gsa_exemption_approved_"
+                                            f"{datetime.today().strftime('%Y%m%d')}.csv"
+                                        ),
+                                        mime="text/csv",
+                                        key="gsa_approved_csv",
+                                    )
+                        except Exception as e:
+                            st.error(f"Error loading approved GSA exemption forms: {str(e)}")
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
@@ -6837,12 +6939,12 @@ GU-TAP System
                     st.markdown(f"##### 🟡 Ticket ID: {selected_ticket_id}")
                     st.markdown(f"🟡 # of Interactions: {num_interaction_ticket if num_interaction_ticket > 0 else 0}")
                     if num_interaction_ticket > 0:
-                        st.dataframe(interactions_for_ticket)
+                        show_df(interactions_for_ticket)
                     else:
                         st.info("No interaction records found for this Ticket ID.")
                     st.markdown(f"🟡 # of Deliveries: {num_delivery_ticket if num_delivery_ticket > 0 else 0}")
                     if num_delivery_ticket > 0:
-                        st.dataframe(deliveries_for_ticket)
+                        show_df(deliveries_for_ticket)
                     else:
                         st.info("No delivery records found for this Ticket ID.")
                   
@@ -6951,7 +7053,7 @@ GU-TAP System
                     if _staff_filt is None or _staff_filt.empty:
                         st.info("No rows match this search or scope.")
                     else:
-                        st.dataframe(
+                        show_df(
                             _staff_filt[_staff_cols],
                             use_container_width=True,
                         )
@@ -7019,7 +7121,7 @@ GU-TAP System
                         ]
 
                         # Display filtered table
-                        st.dataframe(filtered_df2[[
+                        show_df(filtered_df2[[
                             "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
                             "Focus Area", "TA Type", "Assigned Date", "Targeted Due Date","Expected Duration (Days)","Priority", "Assigned Coach", "TA Description",
                             "Document","Coordinator Comment History", "Staff Comment History", "Transfer History"
@@ -7128,7 +7230,7 @@ GU-TAP System
                             </div>
                         """, unsafe_allow_html=True)
 
-                        st.dataframe(df_int_staff_display.reset_index(drop=True), use_container_width=True)
+                        show_df(df_int_staff_display.reset_index(drop=True), use_container_width=True)
                         
 
                     else:
@@ -7181,7 +7283,7 @@ GU-TAP System
                                 df_ticket_int_staff_display["Date of Interaction"] = df_ticket_int_staff_display["Date of Interaction"].dt.strftime("%Y-%m-%d")
                                 
                                 st.markdown(f"**All interactions for Ticket ID: {selected_ticket_view_staff}**")
-                                st.dataframe(df_ticket_int_staff_display.reset_index(drop=True), use_container_width=True)
+                                show_df(df_ticket_int_staff_display.reset_index(drop=True), use_container_width=True)
                             else:
                                 st.info(f"No interactions found for Ticket ID: {selected_ticket_view_staff}")
                     else:
@@ -7473,7 +7575,7 @@ GU-TAP System
                             </div>
                         """, unsafe_allow_html=True)
 
-                        st.dataframe(df_support_prev_disp.reset_index(drop=True), use_container_width=True)
+                        show_df(df_support_prev_disp.reset_index(drop=True), use_container_width=True)
                     else:
                         st.markdown("""
                             <div style='background: #fff3e0; border-radius: 15px; padding: 2em; text-align: center; border: 2px dashed #ff9800;'>
@@ -8644,7 +8746,7 @@ GU-TAP System
                             </div>
                         """, unsafe_allow_html=True)
 
-                        st.dataframe(df_del_staff_display.reset_index(drop=True), use_container_width=True)
+                        show_df(df_del_staff_display.reset_index(drop=True), use_container_width=True)
                         
 
                     else:
@@ -8697,7 +8799,7 @@ GU-TAP System
                                 df_ticket_del_display["Date of Delivery"] = df_ticket_del_display["Date of Delivery"].dt.strftime("%Y-%m-%d")
                                 
                                 st.markdown(f"**All deliveries for Ticket ID: {selected_ticket_view_del}**")
-                                st.dataframe(df_ticket_del_display.reset_index(drop=True), use_container_width=True)
+                                show_df(df_ticket_del_display.reset_index(drop=True), use_container_width=True)
                             else:
                                 st.info(f"No deliveries found for Ticket ID: {selected_ticket_view_del}")
                     else:
@@ -9172,7 +9274,7 @@ GU-TAP System
                         staff_df["Targeted Due Date"] = staff_df["Targeted Due Date"].dt.strftime("%Y-%m-%d")
 
                         # Display clean table (exclude PriorityOrder column)
-                        st.dataframe(staff_df[[
+                        show_df(staff_df[[
                             "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
                             "Focus Area", "TA Type", "Assigned Date", "Targeted Due Date", "Priority", "TA Description","Document","Coordinator Comment History"
                         ]].reset_index(drop=True))
@@ -9259,7 +9361,7 @@ GU-TAP System
                         staff_completed_df["Targeted Due Date"] = staff_completed_df["Targeted Due Date"].dt.strftime("%Y-%m-%d")
                         staff_completed_df["Close Date"] = staff_completed_df["Close Date"].dt.strftime("%Y-%m-%d")
 
-                        st.dataframe(staff_completed_df[[
+                        show_df(staff_completed_df[[
                             "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
                             "Focus Area", "TA Type", "Priority", "Assigned Coach", "TA Description","Document",
                             "Assigned Date", "Targeted Due Date", "Close Date",
@@ -9400,7 +9502,7 @@ GU-TAP System
                     if _ra_filt is None or _ra_filt.empty:
                         st.info("No rows match this search or filter.")
                     else:
-                        st.dataframe(_ra_filt[_ra_cols], use_container_width=True)
+                        show_df(_ra_filt[_ra_cols], use_container_width=True)
                         st.caption(
                             f"Showing {len(_ra_filt)} row(s). Refine the search to narrow results; data is read-only here."
                         )
@@ -9470,7 +9572,7 @@ GU-TAP System
                                 display_cols.insert(2, col)
                         display_cols = [c for c in display_cols if c in all_support_requests.columns]
                         st.markdown("#### 📝 All Submitted Support Requests")
-                        st.dataframe(all_support_requests[display_cols].reset_index(drop=True))
+                        show_df(all_support_requests[display_cols].reset_index(drop=True))
                         
                         # Sort unassigned by deadline and format date for display
                         unassigned_requests["_sort_date"] = unassigned_requests["Date"]
@@ -9607,7 +9709,7 @@ GU-TAP System
                         )
 
                         st.markdown("#### 📋 My Active Requests")
-                        st.dataframe(my_requests[[
+                        show_df(my_requests[[
                             "Request Type","Date", "Time request needed", "Time Commitment", "Anticipated Deadline", "Request description", "Anticipated Deliverable", 
                             "TAP Name", "TAP email", "Request status"
                         ]].reset_index(drop=True))
@@ -9787,7 +9889,7 @@ GU-TAP System
                         )
 
                         st.markdown("#### 📋 My Assigned Requests (Can be Re-assigned)")
-                        st.dataframe(my_assigned_for_reassign[[
+                        show_df(my_assigned_for_reassign[[
                             "Request Type","Date", "Time request needed", "Time Commitment", "Anticipated Deadline", "Request description", "Anticipated Deliverable", 
                             "TAP Name", "TAP email", "Request status"
                         ]].reset_index(drop=True))
@@ -9979,7 +10081,7 @@ GU-TAP System
                         )
 
                         st.markdown("#### ✅ My Completed Requests")
-                        st.dataframe(completed_requests[[
+                        show_df(completed_requests[[
                             "Date", "Time request needed", "Request description", "Anticipated Deliverable", 
                             "TAP Name", "TAP email", "Request status"
                         ]].reset_index(drop=True))
