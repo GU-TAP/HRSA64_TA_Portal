@@ -478,6 +478,17 @@ creds_json = json.dumps(credentials)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
 client = gspread.authorize(creds)
 
+# --- Federal mileage reimbursement ------------------------------------------------------
+# IRS business standard mileage rate. Update these two lines when the rate changes; every
+# calculation and label below reads from them.
+#
+# NOTE: the IRS split 2026 mid-year - 72.5 cents (Jan 1 - Jun 30) and 76 cents (Jul 1 -
+# Dec 31). This single rate applies 76 cents to every trip, which is correct for travel
+# from 1 July 2026 onward but over-states reimbursement for first-half-2026 travel.
+MILEAGE_RATE = 0.76
+MILEAGE_RATE_YEAR = 2026
+
+
 # --- Drive / URL columns in tables ------------------------------------------------------
 # st.dataframe renders a long URL as truncated plain text, so links were neither
 # clickable nor fully copyable. These columns are rendered as real links instead.
@@ -1403,7 +1414,9 @@ def create_pdf(form_data, ws):
     # Mileage Section
     story.append(Paragraph("<b>Mileage</b>", travel_h3))
     story.append(Paragraph("The Mileage (Per Day) should be rounded to the nearest mile.", travel_body))
-    story.append(Paragraph("Mileage for 2025 is $0.70 per mile.", travel_body))
+    story.append(Paragraph(
+        f"Mileage for {MILEAGE_RATE_YEAR} is ${MILEAGE_RATE:.2f} per mile.", travel_body
+    ))
     story.append(Spacer(1, 0.1*inch))
     
     # Mileage: build multiple tables, 7 days per table
@@ -1414,7 +1427,7 @@ def create_pdf(form_data, ws):
     for amount in all_mileage_amounts:
         if amount and str(amount).strip():
             try:
-                grand_mileage_rate_total += round(float(amount) * 0.70, 2)
+                grand_mileage_rate_total += round(float(amount) * MILEAGE_RATE, 2)
             except:
                 pass
     grand_mileage_rate_total = round(grand_mileage_rate_total, 0)
@@ -1434,7 +1447,7 @@ def create_pdf(form_data, ws):
         for amount in amounts_chunk:
             if amount and str(amount).strip():
                 try:
-                    rate = round(float(amount) * 0.70, 2)
+                    rate = round(float(amount) * MILEAGE_RATE, 2)
                     mileage_rates.append(f"${int(rate)}")
                 except:
                     mileage_rates.append('')
@@ -8032,7 +8045,9 @@ GU-TAP System
                             
                             st.header("Mileage Expenses")
                             st.markdown("**The Mileage (Per Day) should be rounded to the nearest mile.**")
-                            st.markdown("**Mileage rate for 2025: $0.70 per mile**")
+                            st.markdown(
+                                f"**Mileage rate for {MILEAGE_RATE_YEAR}: ${MILEAGE_RATE:.2f} per mile**"
+                            )
                             
                             mileage_dates = []
                             mileage_amounts = []
@@ -8047,7 +8062,7 @@ GU-TAP System
                                         mileage_dates.append(st.text_input(f"Day {i+1}", key=f"travel_mileage_date_{i}", placeholder="MM/DD/YY"))
                                         mileage_amounts.append(number_text_input(f"Miles", key=f"travel_mileage_{i}", value=0.0, placeholder="0"))
                             
-                            total_mileage = round(sum([m * 0.70 for m in mileage_amounts if m]),2)
+                            total_mileage = round(sum([m * MILEAGE_RATE for m in mileage_amounts if m]), 2)
                             
                             st.header("Travel Expenses")
                             expense_dates = []
