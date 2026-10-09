@@ -7374,6 +7374,298 @@ GU-TAP System
 
                             except Exception as e:
                                 st.error(f"Error saving comment: {str(e)}")
+
+                st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
+
+                # =====================================================================
+                # DEMO SECTION - "TBD" (name not decided yet)
+                # Phases & progress tracking for longer-running tickets.
+                #
+                # THIS IS A MOCK-UP. Nothing here reads from or writes to Google Sheets.
+                # Everything lives in st.session_state and disappears on logout, so the
+                # team can click through the workflow and react to it before any backend
+                # work is committed to. See the "What building this for real would need"
+                # note at the bottom of the expander.
+                # =====================================================================
+                with st.expander("📈 **TBD — PHASES & PROGRESS TRACKING** · demo"):
+                    st.warning(
+                        "**Demo only.** Nothing on this panel is saved. Phases you add "
+                        "here live in your browser session and vanish when you log out. "
+                        "This exists so we can agree on the workflow before building it."
+                    )
+
+                    st.markdown("""
+                        <div class="gutap-hero">
+                            <div class="gutap-hero-title">📈 Phases &amp; Progress</div>
+                            <div class="gutap-hero-sub">
+                                Break a long-running ticket into named phases so month-end
+                                updates to the core team and HRSA can show what actually
+                                moved, instead of a ticket sitting at "In Progress" for
+                                four months.
+                            </div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                    PHASE_STATUSES = ["Not started", "In progress", "Blocked", "Complete"]
+                    PHASE_STATUS_ICON = {
+                        "Not started": "⚪", "In progress": "🔵",
+                        "Blocked": "🔴", "Complete": "🟢",
+                    }
+
+                    # ---- Step 1: pick the ticket -------------------------------------
+                    st.markdown("##### Step 1 · Choose a ticket")
+                    try:
+                        _demo_ticket_pool = (
+                            df[(df["Assigned Coach"] == staff_name)
+                               & (df["Status"] == "In Progress")]["Ticket ID"]
+                            .dropna().astype(str).unique().tolist()
+                        )
+                    except Exception:
+                        _demo_ticket_pool = []
+                    if not _demo_ticket_pool:
+                        _demo_ticket_pool = ["GU0142 (sample)", "GU0158 (sample)"]
+                        st.caption(
+                            "No in-progress tickets assigned to you, so two sample "
+                            "tickets are shown instead."
+                        )
+
+                    demo_ticket = st.selectbox(
+                        "Ticket", _demo_ticket_pool, index=0, key="demo_phase_ticket",
+                        help="In the real version this panel would appear inside the "
+                             "ticket detail view, already scoped to that ticket.",
+                    )
+
+                    # Session-only store: {ticket_id: {"overall": int, "note": str,
+                    #                                  "phases": [ ... ]}}
+                    if "demo_phase_store" not in st.session_state:
+                        st.session_state.demo_phase_store = {}
+                    if demo_ticket not in st.session_state.demo_phase_store:
+                        st.session_state.demo_phase_store[demo_ticket] = {
+                            "overall": 65,
+                            "note": "Dashboard build is the long pole; training is "
+                                    "scheduled but not started.",
+                            "updated": datetime.today().strftime("%Y-%m-%d"),
+                            "phases": [
+                                {"name": "Scoping call + data inventory",
+                                 "status": "Complete",
+                                 "start": datetime.today().date() - timedelta(days=96),
+                                 "target": datetime.today().date() - timedelta(days=80),
+                                 "progress": 100,
+                                 "note": "Inventory confirmed with the jurisdiction data "
+                                         "lead. Two legacy systems ruled out of scope."},
+                                {"name": "Data sharing agreement",
+                                 "status": "Complete",
+                                 "start": datetime.today().date() - timedelta(days=78),
+                                 "target": datetime.today().date() - timedelta(days=40),
+                                 "progress": 100,
+                                 "note": "Signed three weeks late; legal review was the "
+                                         "bottleneck."},
+                                {"name": "Build linkage-to-care dashboard",
+                                 "status": "In progress",
+                                 "start": datetime.today().date() - timedelta(days=38),
+                                 "target": datetime.today().date() + timedelta(days=12),
+                                 "progress": 55,
+                                 "note": "Three of five views built. Retention view is "
+                                         "waiting on the Q3 data refresh."},
+                                {"name": "Staff training + handoff",
+                                 "status": "Not started",
+                                 "start": None,
+                                 "target": datetime.today().date() + timedelta(days=30),
+                                 "progress": 0,
+                                 "note": ""},
+                            ],
+                        }
+                    _demo_rec = st.session_state.demo_phase_store[demo_ticket]
+
+                    # ---- Step 2: overall progress ------------------------------------
+                    st.markdown("---")
+                    st.markdown("##### Step 2 · Set overall progress")
+                    st.caption(
+                        "Set by hand rather than averaged from the phases below. Three "
+                        "of four phases done rarely means 75% of the real work is done, "
+                        "and the provider is the better judge of that."
+                    )
+                    _c1, _c2 = st.columns([3, 2])
+                    with _c1:
+                        _demo_rec["overall"] = st.slider(
+                            "Overall progress (%)", 0, 100,
+                            int(_demo_rec["overall"]), step=5,
+                            key="demo_overall_slider",
+                        )
+                        st.progress(_demo_rec["overall"] / 100.0)
+                    with _c2:
+                        _demo_rec["note"] = st.text_area(
+                            "Progress note (optional)", value=_demo_rec["note"],
+                            height=110, key="demo_overall_note",
+                            help="One or two lines explaining the number. This is what "
+                                 "would feed the month-end narrative.",
+                        )
+                    _demo_done = sum(
+                        1 for p in _demo_rec["phases"] if p["status"] == "Complete"
+                    )
+                    _demo_blocked = sum(
+                        1 for p in _demo_rec["phases"] if p["status"] == "Blocked"
+                    )
+                    _m1, _m2, _m3 = st.columns(3)
+                    _m1.metric("Overall progress", f"{_demo_rec['overall']}%")
+                    _m2.metric("Phases complete",
+                               f"{_demo_done} / {len(_demo_rec['phases'])}")
+                    _m3.metric("Blocked phases", _demo_blocked)
+
+                    # ---- Step 3: the phases ------------------------------------------
+                    st.markdown("---")
+                    st.markdown("##### Step 3 · Review and update phases")
+
+                    if not _demo_rec["phases"]:
+                        st.info("No phases yet. Add the first one below.")
+
+                    _today_d = datetime.today().date()
+                    for _i, _ph in enumerate(_demo_rec["phases"]):
+                        _overdue = (
+                            _ph["status"] != "Complete"
+                            and _ph.get("target")
+                            and _ph["target"] < _today_d
+                        )
+                        _label = (
+                            f"{PHASE_STATUS_ICON.get(_ph['status'], '⚪')} "
+                            f"**{_ph['name']}** · {_ph['status']} · {_ph['progress']}%"
+                            + ("  ⚠️ past target" if _overdue else "")
+                        )
+                        st.markdown(_label)
+                        _pc1, _pc2, _pc3 = st.columns([2, 2, 1])
+                        with _pc1:
+                            _ph["status"] = st.selectbox(
+                                "Status", PHASE_STATUSES,
+                                index=PHASE_STATUSES.index(_ph["status"]),
+                                key=f"demo_ph_status_{_i}",
+                            )
+                            _ph["progress"] = st.slider(
+                                "Phase progress (%)", 0, 100,
+                                int(_ph["progress"]), step=5,
+                                key=f"demo_ph_prog_{_i}",
+                            )
+                        with _pc2:
+                            _ph["start"] = st.date_input(
+                                "Start date", value=_ph.get("start") or _today_d,
+                                key=f"demo_ph_start_{_i}",
+                            )
+                            _ph["target"] = st.date_input(
+                                "Target date", value=_ph.get("target") or _today_d,
+                                key=f"demo_ph_target_{_i}",
+                            )
+                        with _pc3:
+                            st.markdown("<div style='height:1.8em;'></div>",
+                                        unsafe_allow_html=True)
+                            if st.button("🗑️ Delete", key=f"demo_ph_del_{_i}"):
+                                _demo_rec["phases"].pop(_i)
+                                st.rerun()
+                        _ph["note"] = st.text_area(
+                            "Phase note", value=_ph.get("note", ""), height=70,
+                            key=f"demo_ph_note_{_i}",
+                            help="The month-end report would quote this line. For a "
+                                 "blocked phase, say what is blocking it.",
+                        )
+                        st.markdown(
+                            "<hr style='margin:0.6em 0; border:0; "
+                            "border-top:1px dashed #dee2e6;'>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # ---- Step 4: add a phase -----------------------------------------
+                    st.markdown("##### Step 4 · Add a phase")
+                    st.caption(
+                        "Phase names are free text on purpose: a Data-to-Care build and "
+                        "a workforce training share almost no steps, so a fixed list "
+                        "would just get mis-filled."
+                    )
+                    _a1, _a2, _a3 = st.columns([3, 2, 2])
+                    with _a1:
+                        _new_name = st.text_input(
+                            "Phase name *", key="demo_new_phase_name",
+                            placeholder="e.g. Data sharing agreement",
+                        )
+                    with _a2:
+                        _new_status = st.selectbox(
+                            "Status", PHASE_STATUSES, index=0,
+                            key="demo_new_phase_status",
+                        )
+                    with _a3:
+                        _new_target = st.date_input(
+                            "Target date *", value=_today_d + timedelta(days=30),
+                            key="demo_new_phase_target",
+                        )
+                    _new_note = st.text_input(
+                        "Note (optional)", key="demo_new_phase_note",
+                    )
+                    if st.button("➕ Add phase", key="demo_add_phase"):
+                        if not _new_name.strip():
+                            st.error("Phase name is required.")
+                        else:
+                            _demo_rec["phases"].append({
+                                "name": _new_name.strip(),
+                                "status": _new_status,
+                                "start": _today_d if _new_status != "Not started" else None,
+                                "target": _new_target,
+                                "progress": 100 if _new_status == "Complete" else 0,
+                                "note": _new_note.strip(),
+                            })
+                            st.success(f"Added phase: {_new_name.strip()} (demo only)")
+                            st.rerun()
+
+                    # ---- Step 5: what month-end would look like ----------------------
+                    st.markdown("---")
+                    st.markdown("##### Step 5 · What month-end would show")
+                    st.caption(
+                        "No extra work at month end: the report reads whatever is here. "
+                        "This is the summary the core team and HRSA would see."
+                    )
+                    _summary_rows = [{
+                        "Phase": _p["name"],
+                        "Status": _p["status"],
+                        "Target": _p["target"].strftime("%Y-%m-%d") if _p.get("target") else "",
+                        "Progress": f"{_p['progress']}%",
+                        "Latest note": _p.get("note", ""),
+                    } for _p in _demo_rec["phases"]]
+                    if _summary_rows:
+                        show_df(pd.DataFrame(_summary_rows))
+                    st.markdown(
+                        f"**{demo_ticket}** — overall **{_demo_rec['overall']}%** · "
+                        f"{_demo_done} of {len(_demo_rec['phases'])} phases complete"
+                        + (f" · ⚠️ {_demo_blocked} blocked" if _demo_blocked else "")
+                    )
+                    if _demo_rec.get("note"):
+                        st.markdown(f"> {_demo_rec['note']}")
+
+                    # ---- Notes for the build ------------------------------------------
+                    st.markdown("---")
+                    with st.popover("ℹ️ What building this for real would need"):
+                        st.markdown("""
+**New Google Sheet tab `Phases`** — one row per phase, so a ticket can have any
+number of them:
+
+`Ticket ID` · `Phase Name` · `Phase Order` · `Status` · `Start Date` ·
+`Target Date` · `Phase Progress` · `Note` · `Last Updated` · `Updated By`
+
+**Two new columns on `Main`** — `Overall Progress` (0–100) and `Progress Updated`
+(timestamp, so stale numbers can be flagged).
+
+**Code changes**
+
+- A `load_phases_sheet()` loader — **lazy-loaded when this panel opens**, not eagerly
+  at module level, or it adds 2–3 Sheets API reads to every page load.
+- This panel, wired to read/write the `Phases` tab instead of `session_state`.
+- A read-only copy on the coordinator dashboard.
+- `report.py`: a new payload key and a report section.
+
+**Open questions before building**
+
+1. What is this feature actually called? Everything says "TBD" right now.
+2. Optional always, or required once a ticket passes ~60 days?
+3. Does HRSA want a number, or a narrative status? A stale 80% looks identical
+   to a real one.
+4. Should a blocked phase email the coordinator, or just sit there?
+5. Who can edit — assigned coach only, or any staff? Coordinators read-only?
+                        """)
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
