@@ -7387,27 +7387,32 @@ GU-TAP System
                 # work is committed to.
                 # =====================================================================
                 with st.expander("📈 **TBD — PHASES & PROGRESS TRACKING** · demo"):
-                    st.markdown("""
-                        <div style='background:linear-gradient(135deg,#1a237e 0%,#0d47a1 100%);
-                                    border-radius:18px;padding:1.6em 1.8em;margin-bottom:1.2em;
-                                    box-shadow:0 6px 22px rgba(26,35,126,.22);'>
-                            <div style='color:#fff;font-size:1.45em;font-weight:700;
-                                        letter-spacing:-.01em;margin-bottom:.35em;'>
-                                📈 Phases &amp; Progress
-                            </div>
-                            <div style='color:#c5cae9;font-size:.95em;line-height:1.6;max-width:62em;'>
-                                Break a long engagement into named phases, so a month-end update can
-                                show <b style='color:#fff;'>what actually moved</b> instead of a ticket
-                                sitting at &ldquo;In Progress&rdquo; for four months.
-                            </div>
-                            <div style='display:inline-block;margin-top:1em;background:rgba(255,255,255,.14);
-                                        border:1px solid rgba(255,255,255,.25);border-radius:999px;
-                                        padding:.3em 1em;color:#fff;font-size:.78em;font-weight:600;
-                                        letter-spacing:.04em;'>
-                                DEMO · nothing is saved
-                            </div>
-                        </div>
-                    """, unsafe_allow_html=True)
+
+                    def _h(html):
+                        """
+                        Collapse HTML to one line before handing it to st.markdown.
+
+                        Streamlit runs the string through a markdown parser first. Any
+                        line indented four or more spaces - which every line of HTML
+                        written inside this deeply nested block is - gets treated as a
+                        literal code block and printed as raw tags instead of rendering.
+                        Flattening to a single line with no leading whitespace avoids it.
+                        """
+                        return " ".join(
+                            part.strip() for part in html.split("\n") if part.strip()
+                        )
+
+                    def _md(html):
+                        st.markdown(_h(html), unsafe_allow_html=True)
+
+                    def _bar(pct, color, height=9):
+                        pct = max(0, min(100, int(pct)))
+                        return (
+                            "<div style='background:#e8eaf0;border-radius:999px;"
+                            f"height:{height}px;overflow:hidden;width:100%;'>"
+                            f"<div style='width:{pct}%;background:{color};height:100%;"
+                            "border-radius:999px;'></div></div>"
+                        )
 
                     PHASE_STATUSES = ["Not started", "In progress", "Blocked", "Complete"]
                     PHASE_STYLE = {
@@ -7417,20 +7422,32 @@ GU-TAP System
                         "Complete":    ("#388e3c", "#e8f5e9", "🟢"),
                     }
 
-                    def _demo_bar(pct, color, height=9):
-                        pct = max(0, min(100, int(pct)))
-                        return (
-                            f"<div style='background:#e8eaf0;border-radius:999px;height:{height}px;"
-                            f"overflow:hidden;width:100%;'>"
-                            f"<div style='width:{pct}%;background:{color};height:100%;"
-                            f"border-radius:999px;transition:width .3s;'></div></div>"
+                    _md("""
+                        <div style='background:linear-gradient(135deg,#1a237e 0%,#0d47a1 100%);
+                                    border-radius:18px;padding:1.6em 1.8em;margin-bottom:1.2em;
+                                    box-shadow:0 6px 22px rgba(26,35,126,.22);'>
+                          <div style='color:#fff;font-size:1.45em;font-weight:700;margin-bottom:.35em;'>
+                            📈 Phases &amp; Progress</div>
+                          <div style='color:#c5cae9;font-size:.95em;line-height:1.6;max-width:62em;'>
+                            Break a long engagement into named phases, so a month-end update can show
+                            <b style='color:#fff;'>what actually moved</b> instead of a ticket sitting
+                            at &ldquo;In Progress&rdquo; for four months.</div>
+                          <div style='display:inline-block;margin-top:1em;background:rgba(255,255,255,.14);
+                                      border:1px solid rgba(255,255,255,.25);border-radius:999px;
+                                      padding:.3em 1em;color:#fff;font-size:.78em;font-weight:600;
+                                      letter-spacing:.04em;'>DEMO · nothing is saved</div>
+                        </div>
+                    """)
+
+                    def _step(label):
+                        _md(
+                            "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
+                            "color:#64748b;text-transform:uppercase;margin:1.1em 0 .4em;'>"
+                            f"{label}</div>"
                         )
 
                     # ---- Step 1 · ticket ---------------------------------------------
-                    st.markdown(
-                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
-                        "color:#64748b;text-transform:uppercase;margin:.2em 0 .5em;'>"
-                        "Step 1 · Choose a ticket</div>", unsafe_allow_html=True)
+                    _step("Step 1 · Choose a ticket")
                     try:
                         _demo_pool = (
                             df[(df["Assigned Coach"] == staff_name)
@@ -7480,47 +7497,37 @@ GU-TAP System
                     _done = sum(1 for p in _rec["phases"] if p["status"] == "Complete")
                     _blocked = sum(1 for p in _rec["phases"] if p["status"] == "Blocked")
                     _total = len(_rec["phases"])
-
-                    # ---- Overall summary card ----------------------------------------
                     _ring = "#388e3c" if _rec["overall"] >= 75 else (
                         "#1976d2" if _rec["overall"] >= 40 else "#f57c00")
                     _blocked_badge = (
-                        "· <span style='color:#d32f2f;font-weight:600;'>"
-                        f"{_blocked} blocked</span>" if _blocked else ""
+                        "<span style='color:#d32f2f;font-weight:600;'>"
+                        f" · {_blocked} blocked</span>" if _blocked else ""
                     )
-                    st.markdown(f"""
-                        <div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;
-                                    padding:1.3em 1.5em;margin:1em 0 1.4em;
-                                    box-shadow:0 2px 10px rgba(0,0,0,.05);'>
-                          <div style='display:flex;justify-content:space-between;
-                                      align-items:center;flex-wrap:wrap;gap:1.2em;'>
-                            <div style='flex:1;min-width:16em;'>
-                              <div style='font-size:1.15em;font-weight:700;color:#1a237e;'>{demo_ticket}</div>
-                              <div style='font-size:.82em;color:#64748b;margin-top:.15em;'>
-                                {_done} of {_total} phases complete
-                                {_blocked_badge}
-                              </div>
-                            </div>
-                            <div style='flex:0 0 13em;text-align:right;'>
-                              <div style='font-size:2.1em;font-weight:800;color:{_ring};
-                                          line-height:1;'>{_rec["overall"]}<span
-                                   style='font-size:.45em;font-weight:600;'>%</span></div>
-                              <div style='font-size:.7em;color:#64748b;letter-spacing:.08em;
-                                          text-transform:uppercase;margin-bottom:.5em;'>overall</div>
-                              {_demo_bar(_rec["overall"], _ring, 10)}
-                            </div>
-                          </div>
-                        </div>
-                    """, unsafe_allow_html=True)
+
+                    # ---- Overall summary card ----------------------------------------
+                    _md(
+                        "<div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;"
+                        "padding:1.3em 1.5em;margin:.9em 0 .4em;box-shadow:0 2px 10px rgba(0,0,0,.05);'>"
+                        "<div style='display:flex;justify-content:space-between;align-items:center;"
+                        "flex-wrap:wrap;gap:1.2em;'>"
+                        "<div style='flex:1;min-width:15em;'>"
+                        f"<div style='font-size:1.15em;font-weight:700;color:#1a237e;'>{demo_ticket}</div>"
+                        "<div style='font-size:.82em;color:#64748b;margin-top:.15em;'>"
+                        f"{_done} of {_total} phases complete{_blocked_badge}</div></div>"
+                        "<div style='flex:0 0 13em;text-align:right;'>"
+                        f"<div style='font-size:2.1em;font-weight:800;color:{_ring};line-height:1;'>"
+                        f"{_rec['overall']}<span style='font-size:.45em;font-weight:600;'>%</span></div>"
+                        "<div style='font-size:.7em;color:#64748b;letter-spacing:.08em;"
+                        "text-transform:uppercase;margin-bottom:.5em;'>overall</div>"
+                        f"{_bar(_rec['overall'], _ring, 10)}"
+                        "</div></div></div>"
+                    )
 
                     # ---- Step 2 · overall slider -------------------------------------
-                    st.markdown(
-                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
-                        "color:#64748b;text-transform:uppercase;margin:.2em 0 .4em;'>"
-                        "Step 2 · Set overall progress</div>", unsafe_allow_html=True)
+                    _step("Step 2 · Set overall progress")
                     st.caption(
-                        "Set by hand, not averaged from the phases — three of four phases done "
-                        "rarely means 75% of the real work is done."
+                        "Set by hand, not averaged from the phases — three of four phases "
+                        "done rarely means 75% of the real work is done."
                     )
                     _c1, _c2 = st.columns([3, 2])
                     with _c1:
@@ -7535,11 +7542,7 @@ GU-TAP System
                                  "the month-end narrative.")
 
                     # ---- Step 3 · phases ---------------------------------------------
-                    st.markdown(
-                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
-                        "color:#64748b;text-transform:uppercase;margin:1.2em 0 .4em;'>"
-                        "Step 3 · Review and update phases</div>", unsafe_allow_html=True)
-
+                    _step("Step 3 · Review and update phases")
                     if not _rec["phases"]:
                         st.info("No phases yet — add the first one below.")
 
@@ -7549,30 +7552,27 @@ GU-TAP System
                         _overdue = (_ph["status"] != "Complete"
                                     and _ph.get("target") and _ph["target"] < _today_d)
                         _tgt = _ph["target"].strftime("%b %d, %Y") if _ph.get("target") else "—"
-                        _flag = ("<span style='background:#ffebee;color:#c62828;"
-                                 "padding:.1em .6em;border-radius:999px;font-size:.72em;"
-                                 "font-weight:700;margin-left:.6em;'>PAST TARGET</span>"
-                                 ) if _overdue else ""
-                        st.markdown(f"""
-                            <div style='background:{_bg};border-left:4px solid {_col};
-                                        border-radius:0 12px 12px 0;padding:.9em 1.2em;
-                                        margin:.7em 0 .2em;'>
-                              <div style='display:flex;justify-content:space-between;
-                                          align-items:center;flex-wrap:wrap;gap:.8em;'>
-                                <div style='flex:1;min-width:14em;'>
-                                  <span style='font-size:1.02em;font-weight:700;color:#1a237e;'>
-                                    {_icon} {_ph["name"]}</span>{_flag}
-                                  <div style='font-size:.78em;color:#546e7a;margin-top:.2em;'>
-                                    {_ph["status"]} · target {_tgt}</div>
-                                </div>
-                                <div style='flex:0 0 11em;'>
-                                  {_demo_bar(_ph["progress"], _col, 7)}
-                                  <div style='font-size:.72em;color:#546e7a;text-align:right;
-                                              margin-top:.25em;'>{_ph["progress"]}%</div>
-                                </div>
-                              </div>
-                            </div>
-                        """, unsafe_allow_html=True)
+                        _flag = (
+                            "<span style='background:#ffebee;color:#c62828;padding:.1em .6em;"
+                            "border-radius:999px;font-size:.72em;font-weight:700;"
+                            "margin-left:.6em;'>PAST TARGET</span>" if _overdue else ""
+                        )
+                        _md(
+                            f"<div style='background:{_bg};border-left:4px solid {_col};"
+                            "border-radius:0 12px 12px 0;padding:.9em 1.2em;margin:.8em 0 .1em;'>"
+                            "<div style='display:flex;justify-content:space-between;"
+                            "align-items:center;flex-wrap:wrap;gap:.8em;'>"
+                            "<div style='flex:1;min-width:14em;'>"
+                            "<span style='font-size:1.02em;font-weight:700;color:#1a237e;'>"
+                            f"{_icon} {_ph['name']}</span>{_flag}"
+                            "<div style='font-size:.78em;color:#546e7a;margin-top:.2em;'>"
+                            f"{_ph['status']} · target {_tgt}</div></div>"
+                            "<div style='flex:0 0 11em;'>"
+                            f"{_bar(_ph['progress'], _col, 7)}"
+                            "<div style='font-size:.72em;color:#546e7a;text-align:right;"
+                            f"margin-top:.25em;'>{_ph['progress']}%</div>"
+                            "</div></div></div>"
+                        )
 
                         _e1, _e2, _e3 = st.columns([2, 2, 1])
                         with _e1:
@@ -7604,10 +7604,7 @@ GU-TAP System
                                  "say what is blocking it.")
 
                     # ---- Step 4 · add -------------------------------------------------
-                    st.markdown(
-                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
-                        "color:#64748b;text-transform:uppercase;margin:1.4em 0 .4em;'>"
-                        "Step 4 · Add a phase</div>", unsafe_allow_html=True)
+                    _step("Step 4 · Add a phase")
                     st.caption(
                         "Free text on purpose — a Data-to-Care build and a workforce "
                         "training share almost no steps."
@@ -7639,66 +7636,55 @@ GU-TAP System
                             st.rerun()
 
                     # ---- Step 5 · month-end preview -----------------------------------
-                    st.markdown(
-                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
-                        "color:#64748b;text-transform:uppercase;margin:1.4em 0 .4em;'>"
-                        "Step 5 · What month-end would show</div>", unsafe_allow_html=True)
+                    _step("Step 5 · What month-end would show")
                     st.caption("No extra work at month end — the report reads whatever is here.")
 
-                    _rows = "".join(
-                        f"""<tr>
-                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;
-                                     font-weight:600;color:#1a237e;'>{_p["name"]}</td>
-                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;'>
-                            <span style='background:{PHASE_STYLE[_p["status"]][1]};
-                                         color:{PHASE_STYLE[_p["status"]][0]};padding:.15em .7em;
-                                         border-radius:999px;font-size:.78em;font-weight:700;
-                                         white-space:nowrap;'>{_p["status"]}</span></td>
-                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;
-                                     color:#546e7a;font-size:.85em;white-space:nowrap;'>
-                            {_p["target"].strftime("%b %d, %Y") if _p.get("target") else "—"}</td>
-                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;width:8em;'>
-                            {_demo_bar(_p["progress"], PHASE_STYLE[_p["status"]][0], 6)}</td>
-                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;
-                                     color:#37474f;font-size:.85em;line-height:1.5;'>
-                            {_p.get("note") or "<span style='color:#b0bec5;'>—</span>"}</td>
-                        </tr>""" for _p in _rec["phases"])
+                    _rows = ""
+                    for _p in _rec["phases"]:
+                        _pc, _pb, _pi = PHASE_STYLE.get(
+                            _p["status"], ("#94a3b8", "#f1f5f9", "⚪"))
+                        _pt = _p["target"].strftime("%b %d, %Y") if _p.get("target") else "—"
+                        _pn = _p.get("note") or "<span style='color:#b0bec5;'>—</span>"
+                        _rows += (
+                            "<tr>"
+                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
+                            f"font-weight:600;color:#1a237e;'>{_p['name']}</td>"
+                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;'>"
+                            f"<span style='background:{_pb};color:{_pc};padding:.15em .7em;"
+                            "border-radius:999px;font-size:.78em;font-weight:700;"
+                            f"white-space:nowrap;'>{_p['status']}</span></td>"
+                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
+                            f"color:#546e7a;font-size:.85em;white-space:nowrap;'>{_pt}</td>"
+                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
+                            f"width:8em;'>{_bar(_p['progress'], _pc, 6)}</td>"
+                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
+                            f"color:#37474f;font-size:.85em;line-height:1.5;'>{_pn}</td>"
+                            "</tr>"
+                        )
 
-                    _foot_note = (
+                    _foot = (
                         "<div style='padding:.9em 1.2em;background:#f8f9fa;"
                         "border-top:1px solid #e8eaf0;color:#37474f;font-size:.88em;"
-                        "font-style:italic;'>&ldquo;" + str(_rec.get("note") or "")
-                        + "&rdquo;</div>"
-                    ) if _rec.get("note") else ""
-
-                    st.markdown(f"""
-                        <div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;
-                                    overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.05);'>
-                          <div style='background:#f8f9fa;padding:1em 1.2em;
-                                      border-bottom:1px solid #e8eaf0;'>
-                            <span style='font-weight:700;color:#1a237e;'>{demo_ticket}</span>
-                            <span style='color:#64748b;font-size:.88em;'> — overall
-                              <b style='color:{_ring};'>{_rec["overall"]}%</b> ·
-                              {_done} of {_total} phases complete</span>
-                          </div>
-                          <table style='width:100%;border-collapse:collapse;'>
-                            <thead><tr style='background:#fafbfc;'>
-                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
-                                         color:#64748b;letter-spacing:.07em;'>PHASE</th>
-                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
-                                         color:#64748b;letter-spacing:.07em;'>STATUS</th>
-                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
-                                         color:#64748b;letter-spacing:.07em;'>TARGET</th>
-                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
-                                         color:#64748b;letter-spacing:.07em;'>PROGRESS</th>
-                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
-                                         color:#64748b;letter-spacing:.07em;'>LATEST NOTE</th>
-                            </tr></thead>
-                            <tbody>{_rows}</tbody>
-                          </table>
-                          {_foot_note}
-                        </div>
-                    """, unsafe_allow_html=True)
+                        f"font-style:italic;'>&ldquo;{_rec['note']}&rdquo;</div>"
+                        if _rec.get("note") else ""
+                    )
+                    _head = "".join(
+                        "<th style='padding:.55em .8em;text-align:left;font-size:.7em;"
+                        f"color:#64748b;letter-spacing:.07em;'>{_c}</th>"
+                        for _c in ("PHASE", "STATUS", "TARGET", "PROGRESS", "LATEST NOTE")
+                    )
+                    _md(
+                        "<div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;"
+                        "overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.05);margin-top:.5em;'>"
+                        "<div style='background:#f8f9fa;padding:1em 1.2em;border-bottom:1px solid #e8eaf0;'>"
+                        f"<span style='font-weight:700;color:#1a237e;'>{demo_ticket}</span>"
+                        "<span style='color:#64748b;font-size:.88em;'> — overall "
+                        f"<b style='color:{_ring};'>{_rec['overall']}%</b> · "
+                        f"{_done} of {_total} phases complete</span></div>"
+                        "<table style='width:100%;border-collapse:collapse;'>"
+                        f"<thead><tr style='background:#fafbfc;'>{_head}</tr></thead>"
+                        f"<tbody>{_rows}</tbody></table>{_foot}</div>"
+                    )
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
