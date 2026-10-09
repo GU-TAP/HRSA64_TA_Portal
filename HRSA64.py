@@ -478,6 +478,38 @@ creds_json = json.dumps(credentials)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
 client = gspread.authorize(creds)
 
+# --- Interaction logging ----------------------------------------------------------------
+INTERACTION_TYPES = [
+    "Email", "Phone Call", "In-Person Meeting", "Online Meeting",
+    "Peer Learning Meetings (PLNs)", "Webinars", "Office Hours", "Other",
+]
+
+# Group activities belong to the whole team, so everyone sees them regardless of who
+# happened to log the entry. One-to-one interactions stay with their submitter.
+SHARED_INTERACTION_TYPES = (
+    "Peer Learning Meetings (PLNs)", "Webinars", "Office Hours",
+)
+
+
+def interactions_visible_to(df_interactions, person_name):
+    """A person's own interactions, plus every shared group activity."""
+    if df_interactions is None or getattr(df_interactions, "empty", True):
+        return df_interactions
+    mask = pd.Series(False, index=df_interactions.index)
+    if "Submitted By" in df_interactions.columns:
+        mask = mask | (
+            df_interactions["Submitted By"].astype(str).str.strip()
+            == str(person_name or "").strip()
+        )
+    if "Type of Interaction" in df_interactions.columns:
+        shared = {t.casefold() for t in SHARED_INTERACTION_TYPES}
+        mask = mask | (
+            df_interactions["Type of Interaction"]
+            .astype(str).str.strip().str.casefold().isin(shared)
+        )
+    return df_interactions[mask].copy()
+
+
 # --- Federal mileage reimbursement ------------------------------------------------------
 # IRS business standard mileage rate. Update these two lines when the rate changes; every
 # calculation and label below reads from them.
@@ -4937,10 +4969,10 @@ else:
                         """, unsafe_allow_html=True)
                         
                         # Get interaction data properly
-                        df_int_coord = df_int[df_int["Submitted By"] == coordinator_name].copy()
+                        df_int_coord = interactions_visible_to(df_int, coordinator_name)
                         if not df_int_coord.empty:
                             # Remove columns we don't want to display
-                            display_cols = [col for col in df_int_coord.columns if col not in ['Submitted By', 'Submission Date']]
+                            display_cols = [col for col in df_int_coord.columns if col not in ['Submission Date']]
                             df_int_coord_display = df_int_coord[display_cols].copy()
                             
                             # Sort by Date of Interaction (most recent first)
@@ -5043,38 +5075,43 @@ else:
                         with col2:
                             date_int = st.date_input("Date of Interaction *", value=datetime.today().date())
 
-                        # If No Ticket ID, ask for Jurisdiction
+                        type_interaction = st.selectbox(
+                            "Type of Interaction *",
+                            INTERACTION_TYPES,
+                            index=None,
+                            placeholder="Select option..."
+                        )
+
+                        # Jurisdiction scope is independent of the interaction type, so any
+                        # activity - PLN, webinar, office hours, peer-to-peer - can span
+                        # several jurisdictions. Defaults to one.
+                        multi_juris = st.radio(
+                            "Does this cover one jurisdiction or several?",
+                            ["One jurisdiction", "Multiple jurisdictions"],
+                            index=0,
+                            horizontal=True,
+                            key='juris_scope_coord',
+                            help="Choose Multiple for PLNs, webinars, office hours or any "
+                                 "peer-to-peer activity involving more than one jurisdiction.",
+                        ) == "Multiple jurisdictions"
+
+                        pln_jurisdictions = []
                         jurisdiction_for_no_ticket = None
-                        if ticket_id_int == "No Ticket ID":
+                        if multi_juris:
+                            pln_jurisdictions = st.multiselect(
+                                "Jurisdictions *",
+                                lis_location,
+                                default=[],
+                                placeholder="Select one or more...",
+                                key='juris_pln_coord'
+                            )
+                        elif ticket_id_int == "No Ticket ID":
                             jurisdiction_for_no_ticket = st.selectbox(
                                 "Jurisdiction *",
                                 lis_location,
                                 index=None,
                                 placeholder="Select option...",
                                 key='juris_interaction_coord'
-                            )
-
-                        list_interaction = [
-                            "Email", "Phone Call", "In-Person Meeting", "Online Meeting", "Peer Learning Meetings (PLNs)", "Other"
-                        ]
-
-                        type_interaction = st.selectbox(
-                            "Type of Interaction *",
-                            list_interaction,
-                            index=None,
-                            placeholder="Select option..."
-                        )
-
-                        # PLNs span multiple jurisdictions - kept separate from the single-select above
-                        is_pln = type_interaction == "Peer Learning Meetings (PLNs)"
-                        pln_jurisdictions = []
-                        if is_pln:
-                            pln_jurisdictions = st.multiselect(
-                                "Jurisdiction(s) for PLN *",
-                                lis_location,
-                                default=[],
-                                placeholder="Select one or more...",
-                                key='juris_pln_coord'
                             )
 
 
@@ -5115,8 +5152,8 @@ else:
                             if not ticket_id_int: errors.append("Ticket ID is required.")
                             if ticket_id_int == "No Ticket ID" and not jurisdiction_for_no_ticket and not pln_jurisdictions:
                                 errors.append("Jurisdiction is required when Ticket ID is not provided.")
-                            if is_pln and not pln_jurisdictions:
-                                errors.append("At least one jurisdiction is required for Peer Learning Meetings (PLNs).")
+                            if multi_juris and not pln_jurisdictions:
+                                errors.append("Select at least one jurisdiction, or switch to 'One jurisdiction'.")
                             if not date_int: errors.append("Date of interaction is required.")
                             if not type_interaction: errors.append("Type of interaction is required.")
                             if not interaction_description: errors.append("Short summary is required.")
@@ -5152,7 +5189,7 @@ else:
 
                                 # Resolve the jurisdiction(s) this interaction should be logged under.
                                 # PLNs span multiple jurisdictions -> one row per selected jurisdiction.
-                                if is_pln and pln_jurisdictions:
+                                if multi_juris and pln_jurisdictions:
                                     jurisdiction_values = list(dict.fromkeys(pln_jurisdictions))
                                 else:
                                     ticket_juris = df.loc[df["Ticket ID"].astype(str) == str(ticket_id_int), "Jurisdiction"]
@@ -7213,10 +7250,10 @@ GU-TAP System
                     """, unsafe_allow_html=True)
                     
                     # Get interaction data properly
-                    df_int_staff = df_int[df_int["Submitted By"] == staff_name].copy()
+                    df_int_staff = interactions_visible_to(df_int, staff_name)
                     if not df_int_staff.empty:
                         # Remove columns we don't want to display
-                        display_cols = [col for col in df_int_staff.columns if col not in ['Submitted By', 'Submission Date']]
+                        display_cols = [col for col in df_int_staff.columns if col not in ['Submission Date']]
                         df_int_staff_display = df_int_staff[display_cols].copy()
                         
                         # Sort by Date of Interaction (most recent first)
@@ -7321,29 +7358,34 @@ GU-TAP System
                     with col2:
                         date_int = st.date_input("Date of Interaction *", value=datetime.today().date())
                     
-                    list_interaction = [
-                        "Email", "Phone Call", "In-Person Meeting", "Online Meeting", "Peer Learning Meetings (PLNs)", "Other"
-                    ]
-
-                    # Asked before jurisdiction, because it determines which jurisdiction field applies
                     type_interaction = st.selectbox(
                         "Type of Interaction *",
-                        list_interaction,
+                        INTERACTION_TYPES,
                         index=None,
                         placeholder="Select option..."
                     )
 
-                    is_pln = type_interaction == "Peer Learning Meetings (PLNs)"
+                    # Jurisdiction scope is independent of the interaction type: any activity
+                    # can span several jurisdictions. Defaults to one.
+                    multi_juris = st.radio(
+                        "Does this cover one jurisdiction or several?",
+                        ["One jurisdiction", "Multiple jurisdictions"],
+                        index=0,
+                        horizontal=True,
+                        key='juris_scope_staff',
+                        help="Choose Multiple for PLNs, webinars, office hours or any "
+                             "peer-to-peer activity involving more than one jurisdiction.",
+                    ) == "Multiple jurisdictions"
 
                     jurisdiction_for_no_ticket = None
                     pln_jurisdictions = []
 
-                    if is_pln:
-                        # PLNs span multiple jurisdictions - this replaces the single-jurisdiction field
+                    if multi_juris:
                         pln_jurisdictions = st.multiselect(
-                            "Jurisdiction(s) for PLN *",
+                            "Jurisdictions *",
                             lis_location,
                             default=[],
+                            placeholder="Select one or more...",
                             key='juris_pln_coord'
                         )
                     elif ticket_id_int == "No Ticket ID":
@@ -7408,8 +7450,8 @@ GU-TAP System
                         if not ticket_id_int: errors.append("Ticket ID is required.")
                         if ticket_id_int == "No Ticket ID" and not jurisdiction_for_no_ticket and not pln_jurisdictions:
                             errors.append("Jurisdiction is required when Ticket ID is not provided.")
-                        if is_pln and not pln_jurisdictions:
-                            errors.append("At least one jurisdiction is required for Peer Learning Meetings (PLNs).")
+                        if multi_juris and not pln_jurisdictions:
+                            errors.append("Select at least one jurisdiction, or switch to 'One jurisdiction'.")
                         if not date_int: errors.append("Date of interaction is required.")
                         if not type_interaction: errors.append("Type of interaction is required.")
                         if not interaction_description: errors.append("Short summary is required.")
@@ -7445,7 +7487,7 @@ GU-TAP System
 
                             # Resolve the jurisdiction(s) this interaction should be logged under.
                             # PLNs span multiple jurisdictions -> one row per selected jurisdiction.
-                            if is_pln and pln_jurisdictions:
+                            if multi_juris and pln_jurisdictions:
                                 jurisdiction_values = list(dict.fromkeys(pln_jurisdictions))
                             else:
                                 ticket_juris = df.loc[df["Ticket ID"].astype(str) == str(ticket_id_int), "Jurisdiction"]
@@ -10163,18 +10205,24 @@ GU-TAP System
 
                             ra_type_int = st.selectbox(
                                 "Type of Interaction *",
-                                ["Email", "Phone Call", "In-Person Meeting", "Online Meeting",
-                                 "Peer Learning Meetings (PLNs)", "Other"],
+                                INTERACTION_TYPES,
                                 index=None, placeholder="Select option...", key="ra_int_type",
                             )
 
-                            ra_is_pln = ra_type_int == "Peer Learning Meetings (PLNs)"
+                            # Scope is independent of type; defaults to one jurisdiction.
+                            ra_is_pln = st.radio(
+                                "Does this cover one jurisdiction or several?",
+                                ["One jurisdiction", "Multiple jurisdictions"],
+                                index=0, horizontal=True, key="ra_int_juris_scope",
+                                help="Choose Multiple for PLNs, webinars, office hours or any "
+                                     "peer-to-peer activity spanning jurisdictions.",
+                            ) == "Multiple jurisdictions"
                             ra_juris_no_ticket = None
                             ra_pln_juris = []
 
                             if ra_is_pln:
                                 ra_pln_juris = st.multiselect(
-                                    "Jurisdiction(s) for PLN *", lis_location, default=[],
+                                    "Jurisdictions *", lis_location, default=[],
                                     key="ra_int_juris_pln",
                                 )
                             elif ra_ticket_int == "No Ticket ID":
