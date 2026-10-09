@@ -7384,293 +7384,321 @@ GU-TAP System
                 # THIS IS A MOCK-UP. Nothing here reads from or writes to Google Sheets.
                 # Everything lives in st.session_state and disappears on logout, so the
                 # team can click through the workflow and react to it before any backend
-                # work is committed to. See the "What building this for real would need"
-                # note at the bottom of the expander.
+                # work is committed to.
                 # =====================================================================
                 with st.expander("📈 **TBD — PHASES & PROGRESS TRACKING** · demo"):
-                    st.warning(
-                        "**Demo only.** Nothing on this panel is saved. Phases you add "
-                        "here live in your browser session and vanish when you log out. "
-                        "This exists so we can agree on the workflow before building it."
-                    )
-
                     st.markdown("""
-                        <div class="gutap-hero">
-                            <div class="gutap-hero-title">📈 Phases &amp; Progress</div>
-                            <div class="gutap-hero-sub">
-                                Break a long-running ticket into named phases so month-end
-                                updates to the core team and HRSA can show what actually
-                                moved, instead of a ticket sitting at "In Progress" for
-                                four months.
+                        <div style='background:linear-gradient(135deg,#1a237e 0%,#0d47a1 100%);
+                                    border-radius:18px;padding:1.6em 1.8em;margin-bottom:1.2em;
+                                    box-shadow:0 6px 22px rgba(26,35,126,.22);'>
+                            <div style='color:#fff;font-size:1.45em;font-weight:700;
+                                        letter-spacing:-.01em;margin-bottom:.35em;'>
+                                📈 Phases &amp; Progress
+                            </div>
+                            <div style='color:#c5cae9;font-size:.95em;line-height:1.6;max-width:62em;'>
+                                Break a long engagement into named phases, so a month-end update can
+                                show <b style='color:#fff;'>what actually moved</b> instead of a ticket
+                                sitting at &ldquo;In Progress&rdquo; for four months.
+                            </div>
+                            <div style='display:inline-block;margin-top:1em;background:rgba(255,255,255,.14);
+                                        border:1px solid rgba(255,255,255,.25);border-radius:999px;
+                                        padding:.3em 1em;color:#fff;font-size:.78em;font-weight:600;
+                                        letter-spacing:.04em;'>
+                                DEMO · nothing is saved
                             </div>
                         </div>
                     """, unsafe_allow_html=True)
 
                     PHASE_STATUSES = ["Not started", "In progress", "Blocked", "Complete"]
-                    PHASE_STATUS_ICON = {
-                        "Not started": "⚪", "In progress": "🔵",
-                        "Blocked": "🔴", "Complete": "🟢",
+                    PHASE_STYLE = {
+                        "Not started": ("#94a3b8", "#f1f5f9", "⚪"),
+                        "In progress": ("#1976d2", "#e3f2fd", "🔵"),
+                        "Blocked":     ("#d32f2f", "#ffebee", "🔴"),
+                        "Complete":    ("#388e3c", "#e8f5e9", "🟢"),
                     }
 
-                    # ---- Step 1: pick the ticket -------------------------------------
-                    st.markdown("##### Step 1 · Choose a ticket")
+                    def _demo_bar(pct, color, height=9):
+                        pct = max(0, min(100, int(pct)))
+                        return (
+                            f"<div style='background:#e8eaf0;border-radius:999px;height:{height}px;"
+                            f"overflow:hidden;width:100%;'>"
+                            f"<div style='width:{pct}%;background:{color};height:100%;"
+                            f"border-radius:999px;transition:width .3s;'></div></div>"
+                        )
+
+                    # ---- Step 1 · ticket ---------------------------------------------
+                    st.markdown(
+                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
+                        "color:#64748b;text-transform:uppercase;margin:.2em 0 .5em;'>"
+                        "Step 1 · Choose a ticket</div>", unsafe_allow_html=True)
                     try:
-                        _demo_ticket_pool = (
+                        _demo_pool = (
                             df[(df["Assigned Coach"] == staff_name)
                                & (df["Status"] == "In Progress")]["Ticket ID"]
                             .dropna().astype(str).unique().tolist()
                         )
                     except Exception:
-                        _demo_ticket_pool = []
-                    if not _demo_ticket_pool:
-                        _demo_ticket_pool = ["GU0142 (sample)", "GU0158 (sample)"]
-                        st.caption(
-                            "No in-progress tickets assigned to you, so two sample "
-                            "tickets are shown instead."
-                        )
+                        _demo_pool = []
+                    if not _demo_pool:
+                        _demo_pool = ["GU0142 (sample)", "GU0158 (sample)"]
 
                     demo_ticket = st.selectbox(
-                        "Ticket", _demo_ticket_pool, index=0, key="demo_phase_ticket",
-                        help="In the real version this panel would appear inside the "
-                             "ticket detail view, already scoped to that ticket.",
+                        "Ticket", _demo_pool, index=0, key="demo_phase_ticket",
+                        label_visibility="collapsed",
                     )
 
-                    # Session-only store: {ticket_id: {"overall": int, "note": str,
-                    #                                  "phases": [ ... ]}}
                     if "demo_phase_store" not in st.session_state:
                         st.session_state.demo_phase_store = {}
                     if demo_ticket not in st.session_state.demo_phase_store:
+                        _t = datetime.today().date()
                         st.session_state.demo_phase_store[demo_ticket] = {
                             "overall": 65,
                             "note": "Dashboard build is the long pole; training is "
                                     "scheduled but not started.",
-                            "updated": datetime.today().strftime("%Y-%m-%d"),
                             "phases": [
-                                {"name": "Scoping call + data inventory",
-                                 "status": "Complete",
-                                 "start": datetime.today().date() - timedelta(days=96),
-                                 "target": datetime.today().date() - timedelta(days=80),
+                                {"name": "Scoping call + data inventory", "status": "Complete",
+                                 "start": _t - timedelta(days=96), "target": _t - timedelta(days=80),
                                  "progress": 100,
-                                 "note": "Inventory confirmed with the jurisdiction data "
-                                         "lead. Two legacy systems ruled out of scope."},
-                                {"name": "Data sharing agreement",
-                                 "status": "Complete",
-                                 "start": datetime.today().date() - timedelta(days=78),
-                                 "target": datetime.today().date() - timedelta(days=40),
+                                 "note": "Inventory confirmed with the jurisdiction data lead. "
+                                         "Two legacy systems ruled out of scope."},
+                                {"name": "Data sharing agreement", "status": "Complete",
+                                 "start": _t - timedelta(days=78), "target": _t - timedelta(days=40),
                                  "progress": 100,
-                                 "note": "Signed three weeks late; legal review was the "
-                                         "bottleneck."},
-                                {"name": "Build linkage-to-care dashboard",
-                                 "status": "In progress",
-                                 "start": datetime.today().date() - timedelta(days=38),
-                                 "target": datetime.today().date() + timedelta(days=12),
+                                 "note": "Signed three weeks late; legal review was the bottleneck."},
+                                {"name": "Build linkage-to-care dashboard", "status": "In progress",
+                                 "start": _t - timedelta(days=38), "target": _t + timedelta(days=12),
                                  "progress": 55,
-                                 "note": "Three of five views built. Retention view is "
-                                         "waiting on the Q3 data refresh."},
-                                {"name": "Staff training + handoff",
-                                 "status": "Not started",
-                                 "start": None,
-                                 "target": datetime.today().date() + timedelta(days=30),
-                                 "progress": 0,
-                                 "note": ""},
+                                 "note": "Three of five views built. Retention view is waiting "
+                                         "on the Q3 data refresh."},
+                                {"name": "Staff training + handoff", "status": "Not started",
+                                 "start": None, "target": _t + timedelta(days=30),
+                                 "progress": 0, "note": ""},
                             ],
                         }
-                    _demo_rec = st.session_state.demo_phase_store[demo_ticket]
+                    _rec = st.session_state.demo_phase_store[demo_ticket]
+                    _today_d = datetime.today().date()
+                    _done = sum(1 for p in _rec["phases"] if p["status"] == "Complete")
+                    _blocked = sum(1 for p in _rec["phases"] if p["status"] == "Blocked")
+                    _total = len(_rec["phases"])
 
-                    # ---- Step 2: overall progress ------------------------------------
-                    st.markdown("---")
-                    st.markdown("##### Step 2 · Set overall progress")
+                    # ---- Overall summary card ----------------------------------------
+                    _ring = "#388e3c" if _rec["overall"] >= 75 else (
+                        "#1976d2" if _rec["overall"] >= 40 else "#f57c00")
+                    _blocked_badge = (
+                        "· <span style='color:#d32f2f;font-weight:600;'>"
+                        f"{_blocked} blocked</span>" if _blocked else ""
+                    )
+                    st.markdown(f"""
+                        <div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;
+                                    padding:1.3em 1.5em;margin:1em 0 1.4em;
+                                    box-shadow:0 2px 10px rgba(0,0,0,.05);'>
+                          <div style='display:flex;justify-content:space-between;
+                                      align-items:center;flex-wrap:wrap;gap:1.2em;'>
+                            <div style='flex:1;min-width:16em;'>
+                              <div style='font-size:1.15em;font-weight:700;color:#1a237e;'>{demo_ticket}</div>
+                              <div style='font-size:.82em;color:#64748b;margin-top:.15em;'>
+                                {_done} of {_total} phases complete
+                                {_blocked_badge}
+                              </div>
+                            </div>
+                            <div style='flex:0 0 13em;text-align:right;'>
+                              <div style='font-size:2.1em;font-weight:800;color:{_ring};
+                                          line-height:1;'>{_rec["overall"]}<span
+                                   style='font-size:.45em;font-weight:600;'>%</span></div>
+                              <div style='font-size:.7em;color:#64748b;letter-spacing:.08em;
+                                          text-transform:uppercase;margin-bottom:.5em;'>overall</div>
+                              {_demo_bar(_rec["overall"], _ring, 10)}
+                            </div>
+                          </div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                    # ---- Step 2 · overall slider -------------------------------------
+                    st.markdown(
+                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
+                        "color:#64748b;text-transform:uppercase;margin:.2em 0 .4em;'>"
+                        "Step 2 · Set overall progress</div>", unsafe_allow_html=True)
                     st.caption(
-                        "Set by hand rather than averaged from the phases below. Three "
-                        "of four phases done rarely means 75% of the real work is done, "
-                        "and the provider is the better judge of that."
+                        "Set by hand, not averaged from the phases — three of four phases done "
+                        "rarely means 75% of the real work is done."
                     )
                     _c1, _c2 = st.columns([3, 2])
                     with _c1:
-                        _demo_rec["overall"] = st.slider(
-                            "Overall progress (%)", 0, 100,
-                            int(_demo_rec["overall"]), step=5,
-                            key="demo_overall_slider",
-                        )
-                        st.progress(_demo_rec["overall"] / 100.0)
+                        _rec["overall"] = st.slider(
+                            "Overall progress (%)", 0, 100, int(_rec["overall"]),
+                            step=5, key="demo_overall_slider")
                     with _c2:
-                        _demo_rec["note"] = st.text_area(
-                            "Progress note (optional)", value=_demo_rec["note"],
-                            height=110, key="demo_overall_note",
-                            help="One or two lines explaining the number. This is what "
-                                 "would feed the month-end narrative.",
-                        )
-                    _demo_done = sum(
-                        1 for p in _demo_rec["phases"] if p["status"] == "Complete"
-                    )
-                    _demo_blocked = sum(
-                        1 for p in _demo_rec["phases"] if p["status"] == "Blocked"
-                    )
-                    _m1, _m2, _m3 = st.columns(3)
-                    _m1.metric("Overall progress", f"{_demo_rec['overall']}%")
-                    _m2.metric("Phases complete",
-                               f"{_demo_done} / {len(_demo_rec['phases'])}")
-                    _m3.metric("Blocked phases", _demo_blocked)
+                        _rec["note"] = st.text_area(
+                            "Progress note", value=_rec["note"], height=92,
+                            key="demo_overall_note",
+                            help="One or two lines explaining the number — this feeds "
+                                 "the month-end narrative.")
 
-                    # ---- Step 3: the phases ------------------------------------------
-                    st.markdown("---")
-                    st.markdown("##### Step 3 · Review and update phases")
+                    # ---- Step 3 · phases ---------------------------------------------
+                    st.markdown(
+                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
+                        "color:#64748b;text-transform:uppercase;margin:1.2em 0 .4em;'>"
+                        "Step 3 · Review and update phases</div>", unsafe_allow_html=True)
 
-                    if not _demo_rec["phases"]:
-                        st.info("No phases yet. Add the first one below.")
+                    if not _rec["phases"]:
+                        st.info("No phases yet — add the first one below.")
 
-                    _today_d = datetime.today().date()
-                    for _i, _ph in enumerate(_demo_rec["phases"]):
-                        _overdue = (
-                            _ph["status"] != "Complete"
-                            and _ph.get("target")
-                            and _ph["target"] < _today_d
-                        )
-                        _label = (
-                            f"{PHASE_STATUS_ICON.get(_ph['status'], '⚪')} "
-                            f"**{_ph['name']}** · {_ph['status']} · {_ph['progress']}%"
-                            + ("  ⚠️ past target" if _overdue else "")
-                        )
-                        st.markdown(_label)
-                        _pc1, _pc2, _pc3 = st.columns([2, 2, 1])
-                        with _pc1:
+                    for _i, _ph in enumerate(_rec["phases"]):
+                        _col, _bg, _icon = PHASE_STYLE.get(
+                            _ph["status"], ("#94a3b8", "#f1f5f9", "⚪"))
+                        _overdue = (_ph["status"] != "Complete"
+                                    and _ph.get("target") and _ph["target"] < _today_d)
+                        _tgt = _ph["target"].strftime("%b %d, %Y") if _ph.get("target") else "—"
+                        _flag = ("<span style='background:#ffebee;color:#c62828;"
+                                 "padding:.1em .6em;border-radius:999px;font-size:.72em;"
+                                 "font-weight:700;margin-left:.6em;'>PAST TARGET</span>"
+                                 ) if _overdue else ""
+                        st.markdown(f"""
+                            <div style='background:{_bg};border-left:4px solid {_col};
+                                        border-radius:0 12px 12px 0;padding:.9em 1.2em;
+                                        margin:.7em 0 .2em;'>
+                              <div style='display:flex;justify-content:space-between;
+                                          align-items:center;flex-wrap:wrap;gap:.8em;'>
+                                <div style='flex:1;min-width:14em;'>
+                                  <span style='font-size:1.02em;font-weight:700;color:#1a237e;'>
+                                    {_icon} {_ph["name"]}</span>{_flag}
+                                  <div style='font-size:.78em;color:#546e7a;margin-top:.2em;'>
+                                    {_ph["status"]} · target {_tgt}</div>
+                                </div>
+                                <div style='flex:0 0 11em;'>
+                                  {_demo_bar(_ph["progress"], _col, 7)}
+                                  <div style='font-size:.72em;color:#546e7a;text-align:right;
+                                              margin-top:.25em;'>{_ph["progress"]}%</div>
+                                </div>
+                              </div>
+                            </div>
+                        """, unsafe_allow_html=True)
+
+                        _e1, _e2, _e3 = st.columns([2, 2, 1])
+                        with _e1:
                             _ph["status"] = st.selectbox(
                                 "Status", PHASE_STATUSES,
                                 index=PHASE_STATUSES.index(_ph["status"]),
-                                key=f"demo_ph_status_{_i}",
-                            )
+                                key=f"demo_ph_status_{_i}")
                             _ph["progress"] = st.slider(
-                                "Phase progress (%)", 0, 100,
-                                int(_ph["progress"]), step=5,
-                                key=f"demo_ph_prog_{_i}",
-                            )
-                        with _pc2:
+                                "Progress (%)", 0, 100, int(_ph["progress"]),
+                                step=5, key=f"demo_ph_prog_{_i}")
+                        with _e2:
                             _ph["start"] = st.date_input(
-                                "Start date", value=_ph.get("start") or _today_d,
-                                key=f"demo_ph_start_{_i}",
-                            )
+                                "Start", value=_ph.get("start") or _today_d,
+                                key=f"demo_ph_start_{_i}")
                             _ph["target"] = st.date_input(
-                                "Target date", value=_ph.get("target") or _today_d,
-                                key=f"demo_ph_target_{_i}",
-                            )
-                        with _pc3:
-                            st.markdown("<div style='height:1.8em;'></div>",
+                                "Target", value=_ph.get("target") or _today_d,
+                                key=f"demo_ph_target_{_i}")
+                        with _e3:
+                            st.markdown("<div style='height:1.9em;'></div>",
                                         unsafe_allow_html=True)
-                            if st.button("🗑️ Delete", key=f"demo_ph_del_{_i}"):
-                                _demo_rec["phases"].pop(_i)
+                            if st.button("🗑️ Delete", key=f"demo_ph_del_{_i}",
+                                         use_container_width=True):
+                                _rec["phases"].pop(_i)
                                 st.rerun()
                         _ph["note"] = st.text_area(
-                            "Phase note", value=_ph.get("note", ""), height=70,
+                            "Note", value=_ph.get("note", ""), height=68,
                             key=f"demo_ph_note_{_i}",
-                            help="The month-end report would quote this line. For a "
-                                 "blocked phase, say what is blocking it.",
-                        )
-                        st.markdown(
-                            "<hr style='margin:0.6em 0; border:0; "
-                            "border-top:1px dashed #dee2e6;'>",
-                            unsafe_allow_html=True,
-                        )
+                            help="Quoted in the month-end report. For a blocked phase, "
+                                 "say what is blocking it.")
 
-                    # ---- Step 4: add a phase -----------------------------------------
-                    st.markdown("##### Step 4 · Add a phase")
+                    # ---- Step 4 · add -------------------------------------------------
+                    st.markdown(
+                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
+                        "color:#64748b;text-transform:uppercase;margin:1.4em 0 .4em;'>"
+                        "Step 4 · Add a phase</div>", unsafe_allow_html=True)
                     st.caption(
-                        "Phase names are free text on purpose: a Data-to-Care build and "
-                        "a workforce training share almost no steps, so a fixed list "
-                        "would just get mis-filled."
+                        "Free text on purpose — a Data-to-Care build and a workforce "
+                        "training share almost no steps."
                     )
                     _a1, _a2, _a3 = st.columns([3, 2, 2])
                     with _a1:
                         _new_name = st.text_input(
                             "Phase name *", key="demo_new_phase_name",
-                            placeholder="e.g. Data sharing agreement",
-                        )
+                            placeholder="e.g. Data sharing agreement")
                     with _a2:
                         _new_status = st.selectbox(
-                            "Status", PHASE_STATUSES, index=0,
-                            key="demo_new_phase_status",
-                        )
+                            "Status", PHASE_STATUSES, index=0, key="demo_new_phase_status")
                     with _a3:
                         _new_target = st.date_input(
                             "Target date *", value=_today_d + timedelta(days=30),
-                            key="demo_new_phase_target",
-                        )
-                    _new_note = st.text_input(
-                        "Note (optional)", key="demo_new_phase_note",
-                    )
-                    if st.button("➕ Add phase", key="demo_add_phase"):
+                            key="demo_new_phase_target")
+                    _new_note = st.text_input("Note (optional)", key="demo_new_phase_note")
+                    if st.button("➕ Add phase", key="demo_add_phase", type="primary"):
                         if not _new_name.strip():
                             st.error("Phase name is required.")
                         else:
-                            _demo_rec["phases"].append({
-                                "name": _new_name.strip(),
-                                "status": _new_status,
+                            _rec["phases"].append({
+                                "name": _new_name.strip(), "status": _new_status,
                                 "start": _today_d if _new_status != "Not started" else None,
                                 "target": _new_target,
                                 "progress": 100 if _new_status == "Complete" else 0,
                                 "note": _new_note.strip(),
                             })
-                            st.success(f"Added phase: {_new_name.strip()} (demo only)")
                             st.rerun()
 
-                    # ---- Step 5: what month-end would look like ----------------------
-                    st.markdown("---")
-                    st.markdown("##### Step 5 · What month-end would show")
-                    st.caption(
-                        "No extra work at month end: the report reads whatever is here. "
-                        "This is the summary the core team and HRSA would see."
-                    )
-                    _summary_rows = [{
-                        "Phase": _p["name"],
-                        "Status": _p["status"],
-                        "Target": _p["target"].strftime("%Y-%m-%d") if _p.get("target") else "",
-                        "Progress": f"{_p['progress']}%",
-                        "Latest note": _p.get("note", ""),
-                    } for _p in _demo_rec["phases"]]
-                    if _summary_rows:
-                        show_df(pd.DataFrame(_summary_rows))
+                    # ---- Step 5 · month-end preview -----------------------------------
                     st.markdown(
-                        f"**{demo_ticket}** — overall **{_demo_rec['overall']}%** · "
-                        f"{_demo_done} of {len(_demo_rec['phases'])} phases complete"
-                        + (f" · ⚠️ {_demo_blocked} blocked" if _demo_blocked else "")
-                    )
-                    if _demo_rec.get("note"):
-                        st.markdown(f"> {_demo_rec['note']}")
+                        "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
+                        "color:#64748b;text-transform:uppercase;margin:1.4em 0 .4em;'>"
+                        "Step 5 · What month-end would show</div>", unsafe_allow_html=True)
+                    st.caption("No extra work at month end — the report reads whatever is here.")
 
-                    # ---- Notes for the build ------------------------------------------
-                    st.markdown("---")
-                    # NOTE: st.popover needs Streamlit >= 1.32; this app pins 1.31,
-                    # and expanders cannot nest, so a checkbox toggle is used instead.
-                    if st.checkbox(
-                        "ℹ️ Show what building this for real would need",
-                        key="demo_phase_build_notes",
-                    ):
-                        st.markdown("""
-**New Google Sheet tab `Phases`** — one row per phase, so a ticket can have any
-number of them:
+                    _rows = "".join(
+                        f"""<tr>
+                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;
+                                     font-weight:600;color:#1a237e;'>{_p["name"]}</td>
+                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;'>
+                            <span style='background:{PHASE_STYLE[_p["status"]][1]};
+                                         color:{PHASE_STYLE[_p["status"]][0]};padding:.15em .7em;
+                                         border-radius:999px;font-size:.78em;font-weight:700;
+                                         white-space:nowrap;'>{_p["status"]}</span></td>
+                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;
+                                     color:#546e7a;font-size:.85em;white-space:nowrap;'>
+                            {_p["target"].strftime("%b %d, %Y") if _p.get("target") else "—"}</td>
+                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;width:8em;'>
+                            {_demo_bar(_p["progress"], PHASE_STYLE[_p["status"]][0], 6)}</td>
+                          <td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;
+                                     color:#37474f;font-size:.85em;line-height:1.5;'>
+                            {_p.get("note") or "<span style='color:#b0bec5;'>—</span>"}</td>
+                        </tr>""" for _p in _rec["phases"])
 
-`Ticket ID` · `Phase Name` · `Phase Order` · `Status` · `Start Date` ·
-`Target Date` · `Phase Progress` · `Note` · `Last Updated` · `Updated By`
+                    _foot_note = (
+                        "<div style='padding:.9em 1.2em;background:#f8f9fa;"
+                        "border-top:1px solid #e8eaf0;color:#37474f;font-size:.88em;"
+                        "font-style:italic;'>&ldquo;" + str(_rec.get("note") or "")
+                        + "&rdquo;</div>"
+                    ) if _rec.get("note") else ""
 
-**Two new columns on `Main`** — `Overall Progress` (0–100) and `Progress Updated`
-(timestamp, so stale numbers can be flagged).
-
-**Code changes**
-
-- A `load_phases_sheet()` loader — **lazy-loaded when this panel opens**, not eagerly
-  at module level, or it adds 2–3 Sheets API reads to every page load.
-- This panel, wired to read/write the `Phases` tab instead of `session_state`.
-- A read-only copy on the coordinator dashboard.
-- `report.py`: a new payload key and a report section.
-
-**Open questions before building**
-
-1. What is this feature actually called? Everything says "TBD" right now.
-2. Optional always, or required once a ticket passes ~60 days?
-3. Does HRSA want a number, or a narrative status? A stale 80% looks identical
-   to a real one.
-4. Should a blocked phase email the coordinator, or just sit there?
-5. Who can edit — assigned coach only, or any staff? Coordinators read-only?
-                        """)
+                    st.markdown(f"""
+                        <div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;
+                                    overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.05);'>
+                          <div style='background:#f8f9fa;padding:1em 1.2em;
+                                      border-bottom:1px solid #e8eaf0;'>
+                            <span style='font-weight:700;color:#1a237e;'>{demo_ticket}</span>
+                            <span style='color:#64748b;font-size:.88em;'> — overall
+                              <b style='color:{_ring};'>{_rec["overall"]}%</b> ·
+                              {_done} of {_total} phases complete</span>
+                          </div>
+                          <table style='width:100%;border-collapse:collapse;'>
+                            <thead><tr style='background:#fafbfc;'>
+                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
+                                         color:#64748b;letter-spacing:.07em;'>PHASE</th>
+                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
+                                         color:#64748b;letter-spacing:.07em;'>STATUS</th>
+                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
+                                         color:#64748b;letter-spacing:.07em;'>TARGET</th>
+                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
+                                         color:#64748b;letter-spacing:.07em;'>PROGRESS</th>
+                              <th style='padding:.55em .8em;text-align:left;font-size:.7em;
+                                         color:#64748b;letter-spacing:.07em;'>LATEST NOTE</th>
+                            </tr></thead>
+                            <tbody>{_rows}</tbody>
+                          </table>
+                          {_foot_note}
+                        </div>
+                    """, unsafe_allow_html=True)
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
