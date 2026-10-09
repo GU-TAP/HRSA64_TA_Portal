@@ -50,6 +50,20 @@ CANONICAL_JURISDICTIONS = [
     "Oklahoma", "South Carolina",
 ]
 
+# Places the program serves as part of a larger EHE jurisdiction. The Washington, DC
+# jurisdiction is worked as one unit covering DC, Prince George's County and Montgomery
+# County, MD (see Box: Jurisdictional Files > Washington DC), so those two counties roll
+# up into DC instead of being counted as separate jurisdictions.
+JURISDICTION_ROLLUP = {
+    "Prince George's Co. - Maryland": "Washington, DC",
+    "Montgomery Co. - Maryland": "Washington, DC",
+}
+
+# The jurisdictions the "Jurisdictions engaged" total counts: the EHE list above after the
+# roll-up. Anything else (e.g. "Ohio (OH)", a statewide health-department ticket whose
+# counties are already counted) stays visible in tables and filters but is not counted.
+EHE_JURISDICTIONS = frozenset(j for j in CANONICAL_JURISDICTIONS if j not in JURISDICTION_ROLLUP)
+
 STATE_ABBR = {
     "al": "alabama", "az": "arizona", "ar": "arkansas", "ca": "california",
     "dc": "district of columbia", "fl": "florida", "ga": "georgia", "il": "illinois",
@@ -125,9 +139,15 @@ JURISDICTION_INDEX = _build_jurisdiction_index(CANONICAL_JURISDICTIONS)
 
 def canonical_jurisdiction(raw: Any) -> str | None:
     """
-    Resolve one raw jurisdiction spelling to its canonical name.
+    Resolve one raw jurisdiction spelling to its canonical name, applying the
+    JURISDICTION_ROLLUP (PG / Montgomery County -> Washington, DC).
     Returns None when the value is blank or cannot be matched.
     """
+    name = _match_jurisdiction(raw)
+    return JURISDICTION_ROLLUP.get(name, name) if name else None
+
+
+def _match_jurisdiction(raw: Any) -> str | None:
     n = _nfkd(raw)
     if not n or n.casefold() in JURISDICTION_BLANKS:
         return None
@@ -818,7 +838,12 @@ def compute_payload(
                 if j.casefold() not in JURISDICTION_BLANKS and j != "Unknown"
             }
     engaged_jurisdictions = sorted(engaged_jurisdictions)
-    total_jurisdictions = len(engaged_jurisdictions)
+    # Only EHE jurisdictions count toward the total (PG / Montgomery are already folded
+    # into DC by canonical_jurisdiction). Report anything left out so it isn't silent.
+    not_counted = [j for j in engaged_jurisdictions if j not in EHE_JURISDICTIONS]
+    if not_counted:
+        print("i Not counted as separate EHE jurisdictions: " + "; ".join(not_counted), file=sys.stderr)
+    total_jurisdictions = sum(1 for j in engaged_jurisdictions if j in EHE_JURISDICTIONS)
     
     # Calculate summary statistics
     total_tickets = len(df)
@@ -867,8 +892,10 @@ def compute_payload(
     # Jurisdictions that only appear via an ITA/PLN still deserve a filter entry.
     activity_jurs = set()
     for rec in (ita_records + pln_records):
-        canon = [canonical_jurisdiction(j) or j for j in rec["jurisdictions"]]
+        # dict.fromkeys keeps order and drops repeats (e.g. DC + PG County -> DC once).
+        canon = list(dict.fromkeys(canonical_jurisdiction(j) or j for j in rec["jurisdictions"]))
         rec["jurisdictions"] = canon
+        rec["jurisdiction_count"] = len(canon)
         activity_jurs |= set(canon)
     filter_jurisdictions = sorted(set(engaged_jurisdictions) | activity_jurs)
 
@@ -893,6 +920,7 @@ def compute_payload(
         },
         "months": months,
         "jurisdictions": engaged_jurisdictions,
+        "ehe_jurisdictions": sorted(EHE_JURISDICTIONS),
         "filter_jurisdictions": filter_jurisdictions,
         "focus_area_categories": focus_area_categories,
         "monthly": monthly.to_dict(orient="records"),
@@ -1137,6 +1165,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     .actHead .name { font-size: 14px; font-weight: 700; letter-spacing: -.01em; }
     .actHead .meta { font-size: 11.5px; color: var(--ink-3); font-weight: 500; }
     .swatch { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:6px; vertical-align:baseline; }
+    .plnTopics { margin-top: 18px; }
+    .plnTopics .actHead { margin-bottom: 10px; }
+    .plnTopics tr.total td { font-weight: 600; border-top: 2px solid var(--border); }
     .activity2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
     @media (min-width: 1120px) { .activity2 { grid-template-columns: 1fr 1fr; } }
     .emptyMsg { padding: 18px; text-align: center; color: var(--ink-3); font-size: 12.5px; }
@@ -1435,6 +1466,24 @@ HTML_TEMPLATE = r"""<!doctype html>
             <tbody id="plnTbody"></tbody>
           </table>
         </div>
+      </div>
+    </div>
+
+    <div class="plnTopics">
+      <div class="actHead" style="border-left:4px solid var(--c-pln);">
+        <div>
+          <div class="name" style="color:var(--c-pln);">PLNs by topic</div>
+          <div class="meta" id="plnTopicMeta">&mdash;</div>
+        </div>
+      </div>
+      <div class="activity2">
+        <div class="tableWrap short">
+          <table>
+            <thead><tr><th>Topic</th><th class="num">Completed</th><th class="num">Scheduled</th><th class="num" title="Distinct jurisdictions that attended a completed session on this topic">Jurisdictions reached</th></tr></thead>
+            <tbody id="plnTopicTbody"></tbody>
+          </table>
+        </div>
+        <div id="plnTopicChart" style="height:300px;"></div>
       </div>
     </div>
 
@@ -1805,7 +1854,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       setFilteredLine("fltProgress", inProgress);
       setFilteredLine("fltInteractions", inter);
       setFilteredLine("fltDeliveries", deliv);
-      setFilteredLine("fltJurisdictions", jurSet.size);
+      const EHE = new Set(PAYLOAD.ehe_jurisdictions || []);
+      setFilteredLine("fltJurisdictions", EHE.size ? Array.from(jurSet).filter(j => EHE.has(j)).length : jurSet.size);
       setFilteredLine("fltITA", itas.length);
       setFilteredLine("fltPLN", plns.length);
 
@@ -2155,6 +2205,82 @@ HTML_TEMPLATE = r"""<!doctype html>
       }
       fill(itaTbody, itas, "ITA");
       fill(plnTbody, plns, "PLN");
+      renderPlnTopics(plns);
+    }
+
+    /* PLN sessions grouped by topic (Focus Area), honouring the current filters.
+       "Jurisdictions reached" counts each jurisdiction once per topic, across completed sessions. */
+    function renderPlnTopics(plns){
+      const groups = {};
+      plns.forEach(a => {
+        const label = String(a.focus_area || "").trim() || "Topic not recorded";
+        const key = label.toLowerCase();
+        if (!groups[key]) groups[key] = { topic: label, done: 0, sched: 0, jurs: new Set() };
+        const g = groups[key];
+        if (a.complete) { g.done += 1; (a.jurisdictions || []).forEach(j => g.jurs.add(j)); }
+        else g.sched += 1;
+      });
+      const rows = Object.values(groups).sort((a, b) =>
+        b.done - a.done || b.sched - a.sched || a.topic.localeCompare(b.topic));
+
+      const tbody = document.getElementById("plnTopicTbody");
+      tbody.innerHTML = "";
+      const meta = document.getElementById("plnTopicMeta");
+      if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan='4' class='muted'>No PLNs match the current filters.</td></tr>";
+        meta.textContent = "none in this selection";
+        Plotly.react("plnTopicChart", [], { xaxis: { visible: false }, yaxis: { visible: false },
+          plot_bgcolor: "#fff", paper_bgcolor: "#fff", margin: { t: 10, r: 10, b: 10, l: 10 } }, CHART_CONFIG);
+        return;
+      }
+      const allJurs = new Set();
+      let totDone = 0, totSched = 0;
+      function cell(v, cls, title){ const c = document.createElement("td"); c.textContent = String(v); if (cls) c.className = cls; if (title) c.title = title; return c; }
+      rows.forEach(g => {
+        g.jurs.forEach(j => allJurs.add(j));
+        totDone += g.done; totSched += g.sched;
+        const tr = document.createElement("tr");
+        tr.appendChild(cell(g.topic));
+        tr.appendChild(cell(g.done, "num"));
+        tr.appendChild(cell(g.sched || "\u2014", "num"));
+        tr.appendChild(cell(g.jurs.size, "num", Array.from(g.jurs).sort().join("\n")));
+        tbody.appendChild(tr);
+      });
+      const tr = document.createElement("tr");
+      tr.className = "total";
+      tr.appendChild(cell("All topics"));
+      tr.appendChild(cell(totDone, "num"));
+      tr.appendChild(cell(totSched || "\u2014", "num"));
+      tr.appendChild(cell(allJurs.size, "num", "Distinct jurisdictions across all completed PLNs"));
+      tbody.appendChild(tr);
+      meta.textContent = totDone + " completed across " + rows.length + " topic" + (rows.length === 1 ? "" : "s") +
+                         (totSched ? " \u00b7 " + totSched + " scheduled" : "");
+
+      /* Horizontal stacked bar: completed (solid) + scheduled (light), largest at top. */
+      const cats = rows.map(g => g.topic).reverse();
+      const done = rows.map(g => g.done).reverse();
+      const sched = rows.map(g => g.sched).reverse();
+      const totals = cats.map((_, i) => done[i] + sched[i]);
+      const traces = [
+        { type: "bar", orientation: "h", name: "Completed", y: cats, x: done,
+          marker: { color: "#8a5a00" }, hovertemplate: "%{y}<br>Completed: %{x}<extra></extra>" }
+      ];
+      if (totSched) traces.push(
+        { type: "bar", orientation: "h", name: "Scheduled", y: cats, x: sched,
+          marker: { color: "rgba(138, 90, 0, 0.28)" }, hovertemplate: "%{y}<br>Scheduled: %{x}<extra></extra>" });
+      const h = fitBarHeight("plnTopicChart", cats.length * 2, 110);
+      Plotly.react("plnTopicChart", traces, {
+        barmode: "stack", height: h,
+        xaxis: { title: { text: "PLN sessions", font: { size: 12, color: INK_2 } }, dtick: 1,
+                 range: axisHeadroom(totals), gridcolor: GRID, zeroline: false, tickfont: AXIS_FONT },
+        yaxis: { automargin: true, tickfont: AXIS_FONT, type: "category" },
+        annotations: totalAnnotations(cats, totals),
+        plot_bgcolor: "#fff", paper_bgcolor: "#fff",
+        margin: { t: 30, r: 24, b: 48, l: 10 }, bargap: 0.35,
+        hoverlabel: HOVER, font: { family: AXIS_FONT.family, color: INK_2 },
+        showlegend: !!totSched,
+        legend: { orientation: "h", traceorder: "normal", x: 0, y: 1.12, xanchor: "left", font: { size: 11, color: INK_2 } }
+      }, CHART_CONFIG);
     }
 
     function showActivityDetail(a, kind){
