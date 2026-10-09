@@ -510,6 +510,152 @@ def interactions_visible_to(df_interactions, person_name):
     return df_interactions[mask].copy()
 
 
+def own_interactions(df_interactions, person_name):
+    """
+    A person's own one-to-one interactions only.
+
+    Group activities are deliberately excluded: they are team-wide and get their own
+    section, so they don't bury someone's individual records.
+    """
+    if df_interactions is None or getattr(df_interactions, "empty", True):
+        return df_interactions
+    mask = pd.Series(True, index=df_interactions.index)
+    if "Submitted By" in df_interactions.columns:
+        mask &= (
+            df_interactions["Submitted By"].astype(str).str.strip()
+            == str(person_name or "").strip()
+        )
+    if "Type of Interaction" in df_interactions.columns:
+        shared = {t.casefold() for t in SHARED_INTERACTION_TYPES}
+        mask &= ~(
+            df_interactions["Type of Interaction"]
+            .astype(str).str.strip().str.casefold().isin(shared)
+        )
+    return df_interactions[mask].copy()
+
+
+def group_interactions(df_interactions):
+    """Every shared group activity (PLN / webinar / office hours), whoever logged it."""
+    if df_interactions is None or getattr(df_interactions, "empty", True):
+        return df_interactions
+    if "Type of Interaction" not in df_interactions.columns:
+        return df_interactions.iloc[0:0].copy()
+    shared = {t.casefold() for t in SHARED_INTERACTION_TYPES}
+    mask = (
+        df_interactions["Type of Interaction"]
+        .astype(str).str.strip().str.casefold().isin(shared)
+    )
+    return df_interactions[mask].copy()
+
+
+def _distinct_activity_count(df_rows):
+    """
+    Count events, not rows.
+
+    A multi-jurisdiction activity is stored as one row per jurisdiction, so counting
+    rows would overstate how much happened. An event is one date + type + summary +
+    submitter.
+    """
+    if df_rows is None or getattr(df_rows, "empty", True):
+        return 0
+    keys = [c for c in ("Date of Interaction", "Type of Interaction",
+                        "Short Summary", "Submitted By") if c in df_rows.columns]
+    if not keys:
+        return len(df_rows)
+    return int(df_rows[keys].astype(str).drop_duplicates().shape[0])
+
+
+def render_group_activity_section(df_interactions, key_prefix):
+    """Standalone section for PLNs, webinars and office hours, shared across the team."""
+    st.markdown(
+        """
+        <div style='background: #f3e5f5; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                    padding: 1.5em; margin-bottom: 1.5em; margin-top: 2em;'>
+            <h3 style='color: #4a148c; font-family: "Segoe UI", sans-serif; font-weight: 700;
+                       margin-bottom: 0.3em; text-align: center;'>
+                👥 Group Activities (PLNs, Webinars, Office Hours)
+            </h3>
+            <p style='color: #6a1b9a; text-align: center; margin: 0; font-size: 0.9em;'>
+                Logged by anyone on the team and visible to everyone - kept separate from
+                your own one-to-one interactions.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    grouped = group_interactions(df_interactions)
+    if grouped is None or grouped.empty:
+        st.info("No PLNs, webinars or office hours have been logged yet.")
+        return
+
+    view = grouped.drop(
+        columns=[c for c in ["Submission Date"] if c in grouped.columns]
+    ).copy()
+
+    if "Date of Interaction" in view.columns:
+        view["Date of Interaction"] = pd.to_datetime(
+            view["Date of Interaction"], errors="coerce"
+        )
+        view = view.sort_values("Date of Interaction", ascending=False)
+        recent_cut = pd.Timestamp(datetime.now().date() - timedelta(days=30))
+        recent_rows = view[view["Date of Interaction"] >= recent_cut]
+        view["Date of Interaction"] = view["Date of Interaction"].dt.strftime("%Y-%m-%d")
+    else:
+        recent_rows = view.iloc[0:0]
+
+    total_activities = _distinct_activity_count(view)
+    recent_activities = _distinct_activity_count(recent_rows)
+    jurisdictions_reached = (
+        int(view["Jurisdiction"].astype(str).str.strip().replace("", pd.NA).nunique())
+        if "Jurisdiction" in view.columns else 0
+    )
+
+    st.markdown(
+        f"""
+        <div style='background: #ede7f6; border-radius: 10px; padding: 1em; margin-bottom: 1em; text-align: center;'>
+            <div style='display: flex; justify-content: space-around;'>
+                <div>
+                    <div style='font-size: 1.5em; font-weight: bold; color: #4a148c;'>{total_activities}</div>
+                    <div style='font-size: 0.9em; color: #666;'>Group Activities</div>
+                </div>
+                <div>
+                    <div style='font-size: 1.5em; font-weight: bold; color: #388e3c;'>{recent_activities}</div>
+                    <div style='font-size: 0.9em; color: #666;'>Last 30 Days</div>
+                </div>
+                <div>
+                    <div style='font-size: 1.5em; font-weight: bold; color: #1976d2;'>{jurisdictions_reached}</div>
+                    <div style='font-size: 0.9em; color: #666;'>Jurisdictions Reached</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    available_types = sorted(
+        t for t in view.get(
+            "Type of Interaction", pd.Series(dtype=str)
+        ).astype(str).str.strip().unique() if t and t.lower() != "nan"
+    )
+    chosen_types = st.multiselect(
+        "Filter by activity type",
+        available_types,
+        default=available_types,
+        key=f"{key_prefix}_group_type_filter",
+    )
+    if chosen_types:
+        view = view[view["Type of Interaction"].astype(str).str.strip().isin(chosen_types)]
+
+    st.caption(
+        "A multi-jurisdiction activity is stored as one row per jurisdiction, so the "
+        "table below can show several rows for a single event."
+    )
+    show_df(view.reset_index(drop=True))
+
+
+
+
 # --- Federal mileage reimbursement ------------------------------------------------------
 # IRS business standard mileage rate. Update these two lines when the rate changes; every
 # calculation and label below reads from them.
@@ -4969,10 +5115,10 @@ else:
                         """, unsafe_allow_html=True)
                         
                         # Get interaction data properly
-                        df_int_coord = interactions_visible_to(df_int, coordinator_name)
+                        df_int_coord = own_interactions(df_int, coordinator_name)
                         if not df_int_coord.empty:
                             # Remove columns we don't want to display
-                            display_cols = [col for col in df_int_coord.columns if col not in ['Submission Date']]
+                            display_cols = [col for col in df_int_coord.columns if col not in ['Submitted By', 'Submission Date']]
                             df_int_coord_display = df_int_coord[display_cols].copy()
                             
                             # Sort by Date of Interaction (most recent first)
@@ -5009,6 +5155,8 @@ else:
                                     <p style='color: #666; margin: 0;'>You haven't logged any interactions yet. Start by submitting your first interaction below!</p>
                                 </div>
                             """, unsafe_allow_html=True)
+
+                        render_group_activity_section(df_int, "coord")
 
                         # Middle section: View Interactions by Ticket ID
                         st.markdown("""
@@ -7250,10 +7398,10 @@ GU-TAP System
                     """, unsafe_allow_html=True)
                     
                     # Get interaction data properly
-                    df_int_staff = interactions_visible_to(df_int, staff_name)
+                    df_int_staff = own_interactions(df_int, staff_name)
                     if not df_int_staff.empty:
                         # Remove columns we don't want to display
-                        display_cols = [col for col in df_int_staff.columns if col not in ['Submission Date']]
+                        display_cols = [col for col in df_int_staff.columns if col not in ['Submitted By', 'Submission Date']]
                         df_int_staff_display = df_int_staff[display_cols].copy()
                         
                         # Sort by Date of Interaction (most recent first)
@@ -7291,6 +7439,8 @@ GU-TAP System
                                 <p style='color: #666; margin: 0;'>You haven't logged any interactions yet. Start by submitting your first interaction below!</p>
                             </div>
                         """, unsafe_allow_html=True)
+
+                    render_group_activity_section(df_int, "staff")
 
                     # Middle section: View Interactions by Ticket ID
                     st.markdown("""
