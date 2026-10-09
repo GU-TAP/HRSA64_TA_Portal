@@ -7638,7 +7638,12 @@ GU-TAP System
 
                     # ---- Notes for the build ------------------------------------------
                     st.markdown("---")
-                    with st.popover("ℹ️ What building this for real would need"):
+                    # NOTE: st.popover needs Streamlit >= 1.32; this app pins 1.31,
+                    # and expanders cannot nest, so a checkbox toggle is used instead.
+                    if st.checkbox(
+                        "ℹ️ Show what building this for real would need",
+                        key="demo_phase_build_notes",
+                    ):
                         st.markdown("""
 **New Google Sheet tab `Phases`** — one row per phase, so a ticket can have any
 number of them:
