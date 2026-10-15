@@ -732,6 +732,210 @@ def _is_quota_error(exc) -> bool:
     return ('429' in text) or ('Quota exceeded' in text) or ('RESOURCE_EXHAUSTED' in text)
 
 
+# --- Approval seats -------------------------------------------------------------------
+# Sheet columns are named after the SEAT (Program Assistant / Lead TA / Director), never
+# after the person holding it. Replacing someone is therefore a Streamlit secrets edit -
+# no code change, no sheet change.
+#
+#   [approvers.program_assistant]
+#   email = "and58@georgetown.edu"
+#   name  = "Alexis Dennis"
+#
+# Seats: program_assistant (PA line), lead_ta (Lead line), director (covers either line
+# after escalation), alternate_pa (backup for the PA line).
+APPROVER_SEAT_DEFAULTS = {
+    'program_assistant': {'email': 'and58@georgetown.edu',
+                          'name': 'Alexis Dennis'},
+    'lead_ta':           {'email': 'kd802@georgetown.edu',
+                          'name': 'Kemisha Denny'},
+    'director':          {'email': 'jenevieve.opoku@georgetown.edu',
+                          'name': 'Jenevieve Opoku'},
+    'alternate_pa':      {'email': 'lm1353@georgetown.edu',
+                          'name': 'Lauren Mathae'},
+}
+
+# Which sheet column family each seat writes into. The alternate signs the PA line,
+# so it deliberately shares the Program Assistant columns.
+SEAT_COLUMNS = {
+    'program_assistant': 'Program Assistant',
+    'lead_ta':           'Lead TA',
+    'director':          'Director',
+    'alternate_pa':      'Program Assistant',
+}
+
+
+def _load_approver_seats():
+    seats = {k: dict(v) for k, v in APPROVER_SEAT_DEFAULTS.items()}
+    try:
+        configured = dict(st.secrets['approvers'])
+    except Exception:
+        return seats
+    for seat, info in configured.items():
+        seat = str(seat).strip()
+        if seat not in seats:
+            continue
+        info = dict(info)
+        if str(info.get('email', '')).strip():
+            seats[seat]['email'] = str(info['email']).strip().lower()
+        if str(info.get('name', '')).strip():
+            seats[seat]['name'] = str(info['name']).strip()
+    return seats
+
+
+APPROVERS = _load_approver_seats()
+
+
+def approver(seat, field='email'):
+    """Current holder of an approval seat. approver('lead_ta', 'name') -> approver('lead_ta', 'name')."""
+    return APPROVERS.get(seat, {}).get(field, '')
+
+
+def seat_col(seat, suffix):
+    """Sheet column for a seat: seat_col('lead_ta', 'Approval Status')."""
+    return f"{SEAT_COLUMNS[seat]} {suffix}"
+
+
+def seat_for_email(email):
+    """Which seat, if any, this person currently holds."""
+    e = str(email or '').strip().lower()
+    if not e:
+        return None
+    for seat, info in APPROVERS.items():
+        if info.get('email', '').strip().lower() == e:
+            return seat
+    return None
+
+
+# --- Out of office ----------------------------------------------------------------------
+# Who signs each travel line:
+#   PA line   -> program_assistant (Alexis); alternate_pa (Lauren) covers when she is out
+#   Lead line -> lead_ta (Kemisha); director (Jen) covers when she is out
+# The flag lives in a small 'Out_of_Office' worksheet so the seat holder can switch it
+# from the Coordinator dashboard (no redeploy). The tab is created on first save.
+# Optional fallback in secrets:   [out_of_office]  program_assistant = true
+OOO_SHEET = 'Out_of_Office'
+OOO_COLUMNS = ['Seat', 'Out of Office', 'Back On', 'Updated By', 'Updated At']
+OOO_BACKUP_SEAT = {'program_assistant': 'alternate_pa', 'lead_ta': 'director'}
+
+
+def _truthy(val):
+    return str(val if val is not None else '').strip().lower() in ('true', 'yes', '1', 'y', 'on')
+
+
+@st.cache_data(ttl=600)
+def load_out_of_office():
+    """{seat: {'out': bool, 'back_on': 'YYYY-MM-DD' or ''}} — empty dict if tab missing."""
+    state = {}
+    try:
+        for seat, val in dict(st.secrets['out_of_office']).items():
+            state[str(seat).strip()] = {'out': _truthy(val), 'back_on': ''}
+    except Exception:
+        pass
+    try:
+        rows = get_spreadsheet().worksheet(OOO_SHEET).get_all_records()
+    except Exception:
+        return state
+    for r in rows:
+        seat = str(r.get('Seat', '') or '').strip()
+        if seat:
+            state[seat] = {
+                'out': _truthy(r.get('Out of Office', '')),
+                'back_on': str(r.get('Back On', '') or '').strip(),
+            }
+    return state
+
+
+def seat_is_out(seat):
+    """True while the seat holder is marked out. A 'Back On' date ends it automatically."""
+    info = load_out_of_office().get(seat) or {}
+    if not info.get('out'):
+        return False
+    back = pd.to_datetime(info.get('back_on') or None, errors='coerce')
+    if pd.notna(back) and datetime.now().date() >= back.date():
+        return False
+    return True
+
+
+def line_signer_seat(primary_seat):
+    """Seat that should act on a line right now (backup while the primary is out)."""
+    backup = OOO_BACKUP_SEAT.get(primary_seat)
+    if backup and seat_is_out(primary_seat):
+        return backup
+    return primary_seat
+
+
+def save_out_of_office(seat, is_out, back_on, updated_by):
+    """Upsert one seat's row in the Out_of_Office worksheet."""
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet(OOO_SHEET)
+    except Exception:
+        ws = sh.add_worksheet(title=OOO_SHEET, rows=20, cols=len(OOO_COLUMNS))
+        ws.update([OOO_COLUMNS])
+    df_ooo = pd.DataFrame(ws.get_all_records())
+    for c in OOO_COLUMNS:
+        if c not in df_ooo.columns:
+            df_ooo[c] = ''
+    row = {
+        'Seat': seat,
+        'Out of Office': 'TRUE' if is_out else 'FALSE',
+        'Back On': back_on.strftime('%Y-%m-%d') if (is_out and back_on) else '',
+        'Updated By': updated_by,
+        'Updated At': datetime.now().strftime('%Y-%m-%d %H:%M'),
+    }
+    mask = df_ooo['Seat'].astype(str).str.strip() == seat
+    if mask.any():
+        for k, v in row.items():
+            df_ooo.loc[mask, k] = v
+    else:
+        df_ooo = pd.concat([df_ooo, pd.DataFrame([row])], ignore_index=True)
+    df_ooo = df_ooo[OOO_COLUMNS].fillna('')
+    ws.update([OOO_COLUMNS] + df_ooo.values.tolist())
+    load_out_of_office.clear()
+
+
+# Legacy person-named columns -> seat-named columns. Lets the app run correctly against
+# a sheet that has NOT been migrated yet; values are copied across, originals are left
+# in place so nothing is destroyed before the one-off migration is run.
+LEGACY_APPROVAL_COLUMNS = {
+    'Lauren': 'Program Assistant',
+    'Kemisha': 'Lead TA',
+    'Jen': 'Director',
+    'Mabintou': 'Program Assistant',   # pre-handover; folds into the PA seat
+}
+APPROVAL_COLUMN_SUFFIXES = ('Approval Status', 'Approval Date', 'Signature', 'Note')
+
+
+def _is_blank_series(col):
+    return col.astype(str).str.strip().str.lower().isin(('', 'nan', 'nat', 'none'))
+
+
+def normalize_approval_columns(df_in):
+    """
+    Copy any legacy person-named approval columns onto their seat-named equivalents.
+
+    A legacy value is only used where the seat column is still blank, so a newer
+    signature is never overwritten by an older one. 'Mabintou' is applied last for the
+    same reason: it is the oldest source and must lose to anything already recorded.
+    """
+    if df_in is None or getattr(df_in, 'empty', True):
+        return df_in
+    df_out = df_in.copy()
+    ordered = [k for k in LEGACY_APPROVAL_COLUMNS if k != 'Mabintou'] + ['Mabintou']
+    for old in ordered:
+        new = LEGACY_APPROVAL_COLUMNS[old]
+        for suffix in APPROVAL_COLUMN_SUFFIXES:
+            old_col, new_col = f'{old} {suffix}', f'{new} {suffix}'
+            if old_col not in df_out.columns:
+                continue
+            if new_col not in df_out.columns:
+                df_out[new_col] = df_out[old_col]
+                continue
+            blank = _is_blank_series(df_out[new_col])
+            df_out.loc[blank, new_col] = df_out.loc[blank, old_col]
+    return df_out
+
+
 EMAIL_SENDER_NAME = "GU-TAP System"
 
 
@@ -776,19 +980,6 @@ def _send_via_mailjet(to_email, subject, body):
 
 
 def _send_via_gmail_smtp(to_email, subject, body):
-    """
-    Send through Google's own servers as a georgetown.edu account.
-
-    Google signs the message with the sending domain's DKIM key, so no DNS records
-    are needed on our side. Expected secrets:
-
-        [gmail]
-        user = "gutap@georgetown.edu"
-        app_password = "xxxxxxxxxxxxxxxx"   # 16-char app password, 2-Step Verification on
-        host = "smtp.gmail.com"             # optional; "smtp-relay.gmail.com" for the relay
-        port = 587                          # optional
-        reply_to = "gutap@georgetown.edu"   # optional
-    """
     conf = st.secrets["gmail"]
     user = str(conf["user"]).strip()
     password = str(conf["app_password"]).strip().replace(" ", "")
@@ -2096,16 +2287,16 @@ def create_pdf(form_data, ws):
             return str(date_value) if date_value else ''
     
     # Get coordinator signatures and dates if available.
-    # Program Assistant slot is Lauren Mathae. The legacy 'mabintou_*' keys are still read
+    # Program Assistant slot is whoever currently holds the seat. Legacy 'mabintou_*' keys are still read
     # as a fallback so PDFs regenerated from pre-handover sheet rows keep their signature.
     lauren_sig_text = str(
-        form_data.get('lauren_signature') or form_data.get('mabintou_signature') or ''
+        form_data.get('pa_signature') or form_data.get('mabintou_signature') or ''
     ).strip()
-    kemisha_sig_text = str(form_data.get('kemisha_signature') or '').strip()
+    kemisha_sig_text = str(form_data.get('lead_signature') or '').strip()
     lauren_date = format_date_for_pdf(
-        form_data.get('lauren_approval_date') or form_data.get('mabintou_approval_date') or ''
+        form_data.get('pa_approval_date') or form_data.get('mabintou_approval_date') or ''
     )
-    kemisha_date = format_date_for_pdf(form_data.get('kemisha_approval_date', ''))
+    kemisha_date = format_date_for_pdf(form_data.get('lead_approval_date', ''))
     traveler_date = format_date_for_pdf(form_data.get('signature_date', ''))
     
     # Generate Lauren signature image (Program Assistant)
@@ -2267,73 +2458,108 @@ GSA_REASON_OPTION_LABELS = [
 ]
 
 
+def travel_traveler_kind(traveler_name, traveler_email=''):
+    """
+    'lead'    -> the Lead TA's own trip (Kemisha)        : PA line + Director
+    'pa'      -> a PA-line holder's own trip (Alexis/Lauren): Director + Lead line
+    'general' -> everyone else (staff)                    : PA line + Lead line
+    """
+    tn = str(traveler_name or '').lower()
+    te = str(traveler_email or '').strip().lower()
+    if te == approver('lead_ta') or 'kemisha' in tn:
+        return 'lead'
+    if te in (approver('program_assistant'), approver('alternate_pa')) or 'lauren mathae' in tn:
+        return 'pa'
+    return 'general'
+
+
+def travel_required_lines(traveler_name, traveler_email=''):
+    """
+    The two signature lines a travel form needs, in PDF order (first -> 'Program Assistant'
+    row, second -> 'Lead Technical Assistance Provider' row).
+
+    Each line: primary seat, optional backup seat (covers while the primary is out of office
+    or after the escalation reminder), and the sheet column families that satisfy it.
+    """
+    kind = travel_traveler_kind(traveler_name, traveler_email)
+    pa_line = {'key': 'pa', 'primary': 'program_assistant', 'backup': 'alternate_pa',
+               'prefixes': ['Program Assistant']}
+    lead_line = {'key': 'lead', 'primary': 'lead_ta', 'backup': 'director',
+                 'prefixes': ['Lead TA', 'Director']}
+    director_line = {'key': 'director', 'primary': 'director', 'backup': None,
+                     'prefixes': ['Director']}
+    if kind == 'lead':
+        return [pa_line, director_line]
+    if kind == 'pa':
+        # Jen already signs the first line, so she cannot also cover Kemisha's line here.
+        return [director_line, dict(lead_line, backup=None, prefixes=['Lead TA'])]
+    return [pa_line, lead_line]
+
+
+def travel_line_signed_prefix(row, line):
+    """Column family that approved this line, or None."""
+    for prefix in line['prefixes']:
+        if _travel_approval_status_norm(row.get(f'{prefix} Approval Status')) == 'approve':
+            return prefix
+    return None
+
+
+def travel_row_lines(row):
+    return travel_required_lines(row.get('Name', ''), row.get('Email', ''))
+
+
+def travel_row_all_lines_signed(row) -> bool:
+    return all(travel_line_signed_prefix(row, ln) for ln in travel_row_lines(row))
+
+
 def travel_routing_from_traveler(traveler_name, traveler_email=''):
     """
-    Same routing as Travel Authorization (finalize / coordinator review).
-    Returns approver emails and sheet status column names.
+    Who is emailed and which status columns are set to 'pending' when a form is submitted.
+    Out-of-office is applied here: Alexis out -> Lauren (same PA columns);
+    Kemisha out -> Jen (Director columns).
     """
-    tn = (traveler_name or '').lower()
-    te = (traveler_email or '').lower()
-    is_kemisha_traveler = (te == 'kd802@georgetown.edu' or 'kemisha' in tn)
-    is_lauren_traveler = (te == 'lm1353@georgetown.edu' or 'lauren mathae' in tn)
-    out_of_office = {'kemisha': False, 'lauren': False}
-
-    if is_kemisha_traveler:
-        return {
-            'approver1_email': 'lm1353@georgetown.edu',
-            'approver1_name': 'Lauren Mathae',
-            'approver1_status_col': 'Lauren Approval Status',
-            'approver2_email': 'jenevieve.opoku@georgetown.edu',
-            'approver2_name': 'Jenevieve Opoku',
-            'approver2_status_col': 'Jen Approval Status',
-        }
-    if is_lauren_traveler:
-        return {
-            'approver1_email': 'jenevieve.opoku@georgetown.edu',
-            'approver1_name': 'Jenevieve Opoku',
-            'approver1_status_col': 'Jen Approval Status',
-            'approver2_email': 'kd802@georgetown.edu',
-            'approver2_name': 'Kemisha Denny',
-            'approver2_status_col': 'Kemisha Approval Status',
-        }
-    if out_of_office.get('lauren', False):
-        # Lauren out → Jen covers the Program Assistant line.
-        a1_email, a1_name, a1_col = 'jenevieve.opoku@georgetown.edu', 'Jenevieve Opoku', 'Jen Approval Status'
-    else:
-        a1_email, a1_name, a1_col = 'lm1353@georgetown.edu', 'Lauren Mathae', 'Lauren Approval Status'
-    if out_of_office.get('kemisha', False):
-        a2_email, a2_name, a2_col = 'jenevieve.opoku@georgetown.edu', 'Jenevieve Opoku', 'Jen Approval Status'
-    else:
-        a2_email, a2_name, a2_col = 'kd802@georgetown.edu', 'Kemisha Denny', 'Kemisha Approval Status'
-    return {
-        'approver1_email': a1_email,
-        'approver1_name': a1_name,
-        'approver1_status_col': a1_col,
-        'approver2_email': a2_email,
-        'approver2_name': a2_name,
-        'approver2_status_col': a2_col,
-    }
+    lines = travel_required_lines(traveler_name, traveler_email)
+    out = {}
+    for n, ln in enumerate(lines, start=1):
+        seat = line_signer_seat(ln['primary']) if ln.get('backup') else ln['primary']
+        out[f'approver{n}_email'] = approver(seat)
+        out[f'approver{n}_name'] = approver(seat, 'name')
+        out[f'approver{n}_status_col'] = seat_col(seat, 'Approval Status')
+    return out
 
 
-# General travel submitters (not Kemisha/Lauren themselves): first week = Lauren + Kemisha only;
-# after TRAVEL_ESCALATION_DAYS, Jen + Lauren are added as alternate approvers (either may cover each role).
+def travel_seat_can_act_on_line(row, line, seat) -> bool:
+    """Is this line in `seat`'s queue right now?"""
+    if seat == line['primary']:
+        return True
+    if seat == line.get('backup'):
+        return (
+            seat_is_out(line['primary'])
+            or travel_escalation_applied(row)
+            or travel_row_overdue(row)
+        )
+    return False
+
+
+def travel_row_overdue(row) -> bool:
+    """Submitted at least TRAVEL_ESCALATION_DAYS ago (backups may sign from then on)."""
+    sub_d = _travel_submission_date(row)
+    if sub_d is None:
+        return False
+    return (datetime.now().date() - sub_d).days >= TRAVEL_ESCALATION_DAYS
+
+
+# Reminders: after TRAVEL_ESCALATION_DAYS with a line still unsigned, the primary signer AND
+# their backup (Lauren for Alexis, Jen for Kemisha) are emailed and the backup can sign.
+# The reminder repeats every TRAVEL_REMINDER_REPEAT_DAYS until the form is signed or the
+# trip is over. TRAVEL_ESCALATION_COL holds the date of the most recent reminder.
 TRAVEL_ESCALATION_COL = 'Travel Escalation Sent'  # Optional on sheet until first write; app creates column if missing.
 TRAVEL_ESCALATION_DAYS = 7
-TRAVEL_ESCALATION_NOTIFY_EMAILS = [
-    ('kd802@georgetown.edu', 'Kemisha Denny'),
-    ('jenevieve.opoku@georgetown.edu', 'Jenevieve Opoku'),
-    ('lm1353@georgetown.edu', 'Lauren Mathae'),
-]
+TRAVEL_REMINDER_REPEAT_DAYS = 7
 
 
 def is_general_travel_submitter(traveler_name, traveler_email):
-    tn = (traveler_name or '').lower()
-    te = (traveler_email or '').lower()
-    if te == 'kd802@georgetown.edu' or 'kemisha' in tn:
-        return False
-    if te == 'lm1353@georgetown.edu' or 'lauren mathae' in tn:
-        return False
-    return True
+    return travel_traveler_kind(traveler_name, traveler_email) == 'general'
 
 
 def _travel_approval_status_norm(val):
@@ -2341,9 +2567,9 @@ def _travel_approval_status_norm(val):
 
 
 TRAVEL_APPROVER_STATUS_COLUMNS = (
-    'Kemisha Approval Status',
-    'Jen Approval Status',
-    'Lauren Approval Status',
+    'Lead TA Approval Status',
+    'Director Approval Status',
+    'Program Assistant Approval Status',
 )
 
 
@@ -2405,18 +2631,16 @@ def travel_row_exclude_from_pending_coordinator_queue(row) -> bool:
 
 
 def travel_general_slot1_ok(row) -> bool:
-    """Program Assistant slot: Lauren or Jen (after escalation)."""
-    return (
-        _travel_approval_status_norm(row.get('Jen Approval Status')) == 'approve'
-        or _travel_approval_status_norm(row.get('Lauren Approval Status')) == 'approve'
-    )
+    """PA line: Alexis, or Lauren covering (both write the Program Assistant columns).
+    Jen does NOT count here — otherwise one Director signature would complete both lines."""
+    return _travel_approval_status_norm(row.get('Program Assistant Approval Status')) == 'approve'
 
 
 def travel_general_slot2_ok(row) -> bool:
     """Lead TA slot: Kemisha or Jen (after escalation)."""
     return (
-        _travel_approval_status_norm(row.get('Kemisha Approval Status')) == 'approve'
-        or _travel_approval_status_norm(row.get('Jen Approval Status')) == 'approve'
+        _travel_approval_status_norm(row.get('Lead TA Approval Status')) == 'approve'
+        or _travel_approval_status_norm(row.get('Director Approval Status')) == 'approve'
     )
 
 
@@ -2494,45 +2718,7 @@ def travel_sheet_row_to_pdf_form_data(r):
     Build the dict expected by create_pdf() from one Travel worksheet row.
     Coordinator signature cells follow the same routing as final approval (Lauren/Jen · Kemisha/Jen).
     """
-    traveler_name_check = str(r.get('Name', '')).lower()
-    traveler_email_check = str(r.get('Email', '')).lower()
-    is_kemisha_traveler = (
-        traveler_email_check == 'kd802@georgetown.edu' or 'kemisha' in traveler_name_check
-    )
-    is_lauren_traveler = (
-        traveler_email_check == 'lm1353@georgetown.edu' or 'lauren mathae' in traveler_name_check
-    )
-
-    if is_kemisha_traveler:
-        lauren_sig_pdf = str(r.get('Lauren Signature', '') or '')
-        kemisha_sig_pdf = str(r.get('Jen Signature', '') or '')
-        lauren_date = str(r.get('Lauren Approval Date', '') or '')
-        kemisha_date = str(r.get('Jen Approval Date', '') or '')
-    elif is_lauren_traveler:
-        lauren_sig_pdf = str(r.get('Lauren Signature', '') or '')
-        kemisha_sig_pdf = str(r.get('Kemisha Signature', '') or '')
-        lauren_date = str(r.get('Lauren Approval Date', '') or '')
-        kemisha_date = str(r.get('Kemisha Approval Date', '') or '')
-    else:
-        if _travel_approval_status_norm(r.get('Lauren Approval Status')) == 'approve':
-            lauren_sig_pdf = str(r.get('Lauren Signature', '') or '')
-            lauren_date = str(r.get('Lauren Approval Date', '') or '')
-        elif _travel_approval_status_norm(r.get('Jen Approval Status')) == 'approve':
-            # After escalation Jen may cover the Program Assistant line.
-            lauren_sig_pdf = str(r.get('Jen Signature', '') or '')
-            lauren_date = str(r.get('Jen Approval Date', '') or '')
-        else:
-            lauren_sig_pdf = ''
-            lauren_date = ''
-        if _travel_approval_status_norm(r.get('Kemisha Approval Status')) == 'approve':
-            kemisha_sig_pdf = str(r.get('Kemisha Signature', '') or '')
-            kemisha_date = str(r.get('Kemisha Approval Date', '') or '')
-        elif _travel_approval_status_norm(r.get('Jen Approval Status')) == 'approve':
-            kemisha_sig_pdf = str(r.get('Jen Signature', '') or '')
-            kemisha_date = str(r.get('Jen Approval Date', '') or '')
-        else:
-            kemisha_sig_pdf = ''
-            kemisha_date = ''
+    (lauren_sig_pdf, lauren_date, _n1), (kemisha_sig_pdf, kemisha_date, _n2) = travel_pdf_signature_lines(r)
 
     return {
         'name': _travel_pdf_safe_get(r.get('Name', '')),
@@ -2579,10 +2765,10 @@ def travel_sheet_row_to_pdf_form_data(r):
         'dinner_checks': _travel_pdf_safe_json_loads(r.get('Dinner Checks', '[]'), data_type='bool'),
         'total_per_diem': _travel_pdf_safe_get_numeric(r.get('Total Per Diem', 0)),
         'total_amount_due': _travel_pdf_safe_get_numeric(r.get('Total Amount Due', 0)),
-        'lauren_signature': lauren_sig_pdf,
-        'kemisha_signature': kemisha_sig_pdf,
-        'lauren_approval_date': _travel_pdf_safe_get(lauren_date),
-        'kemisha_approval_date': _travel_pdf_safe_get(kemisha_date),
+        'pa_signature': lauren_sig_pdf,
+        'lead_signature': kemisha_sig_pdf,
+        'pa_approval_date': _travel_pdf_safe_get(lauren_date),
+        'lead_approval_date': _travel_pdf_safe_get(kemisha_date),
     }
 
 
@@ -2614,14 +2800,7 @@ def travel_row_has_modern_pending_approval(row) -> bool:
     return False
 
 
-# --- Program Assistant handover (Mabintou Ouattara -> Lauren Mathae) -------------------
-# Requests submitted on/after this date use the Lauren routing and the normal automated
-# workflow (escalation reminders, final approval email to the traveler).
-#
-# Requests submitted BEFORE this date are legacy: the app does not re-route them, does not
-# escalate them, does not flip any of their approval statuses, and does not email anyone
-# about them. They are hidden from the coordinator pending queue and surface only under
-# "Fully Approved Forms". A blank Lauren column on a legacy row is expected, not an error.
+# --- Program Assistant cutoff -------------------------------------------------
 TRAVEL_NEW_LOGIC_START = datetime(2026, 8, 4).date()
 
 
@@ -2636,20 +2815,13 @@ def travel_row_is_new_logic(row) -> bool:
 
 
 def travel_legacy_fully_approved(row) -> bool:
-    """
-    Completion test for pre-handover rows.
-
-    These were signed by Mabintou (Program Assistant) + Kemisha (Lead), with Jen sometimes
-    covering a line. Lauren will normally be blank on them. Any two approver lines signed
-    counts as complete; a missing Lauren signature is not treated as outstanding work.
-    """
     if travel_row_has_any_rejection(row):
         return False
     legacy_cols = (
         'Mabintou Approval Status',
-        'Kemisha Approval Status',
-        'Jen Approval Status',
-        'Lauren Approval Status',
+        'Lead TA Approval Status',
+        'Director Approval Status',
+        'Program Assistant Approval Status',
     )
     signed = sum(
         1 for c in legacy_cols
@@ -2662,25 +2834,61 @@ def travel_escalation_applied(row) -> bool:
     return bool(str(row.get(TRAVEL_ESCALATION_COL, '') or '').strip())
 
 
+def travel_pdf_signature_lines(row):
+    """
+    [(signature, date, signer_name), (signature, date, signer_name)] in PDF row order,
+    taken from whichever column family actually signed each line.
+    """
+    out = []
+    for ln in travel_row_lines(row):
+        prefix = travel_line_signed_prefix(row, ln)
+        if not prefix:
+            out.append(('', '', ''))
+            continue
+        sig = str(row.get(f'{prefix} Signature', '') or '').strip()
+        if sig.lower() == 'nan':
+            sig = ''
+        date_v = str(row.get(f'{prefix} Approval Date', '') or '').strip()
+        if date_v.lower() == 'nan':
+            date_v = ''
+        seat = {'Program Assistant': 'program_assistant', 'Lead TA': 'lead_ta',
+                'Director': 'director'}[prefix]
+        # The PA columns are shared by Alexis and Lauren, so the typed signature is the
+        # reliable record of who actually signed.
+        out.append((sig, date_v, sig or approver(seat, 'name')))
+    return out
+
+
+def travel_row_fully_approved(row) -> bool:
+    """Every required line signed and nothing rejected (post-handover rows)."""
+    if travel_row_has_any_rejection(row):
+        return False
+    return travel_row_all_lines_signed(row)
+
+
+def travel_last_reminder_date(row):
+    return _travel_sheet_date_to_date(row.get(TRAVEL_ESCALATION_COL))
+
+
 def travel_row_needs_escalation(row) -> bool:
+    """True when a reminder email is due (first one after TRAVEL_ESCALATION_DAYS, then repeats)."""
     # Legacy rows are frozen: no status changes, no reminder emails.
     if not travel_row_is_new_logic(row):
-        return False
-    if not is_general_travel_submitter(row.get('Name', ''), row.get('Email', '')):
         return False
     if travel_row_has_any_rejection(row):
         return False
     if travel_row_is_past_travel(row):
         return False
-    if travel_escalation_applied(row):
+    if travel_row_all_lines_signed(row):
         return False
-    if travel_general_fully_approved(row):
-        return False
+    today = datetime.now().date()
+    last = travel_last_reminder_date(row)
+    if last is not None:
+        return (today - last).days >= TRAVEL_REMINDER_REPEAT_DAYS
     sub_d = _travel_submission_date(row)
     if sub_d is None:
         return False
-    age = (datetime.now().date() - sub_d).days
-    return age >= TRAVEL_ESCALATION_DAYS
+    return (today - sub_d).days >= TRAVEL_ESCALATION_DAYS
 
 
 def _travel_needs_action(val) -> bool:
@@ -2688,11 +2896,31 @@ def _travel_needs_action(val) -> bool:
     return v in ('', 'pending', 'nan') or val is None or (isinstance(val, float) and pd.isna(val))
 
 
-def process_travel_review_escalations(df_travel, client):
+def travel_reminder_recipients(row):
+    """[(email, name, line_label)] for every line still unsigned: primary + backup."""
+    labels = {'pa': 'Program Assistant line', 'lead': 'Lead TA line', 'director': 'Director line'}
+    recipients, seen = [], set()
+    for ln in travel_row_lines(row):
+        if travel_line_signed_prefix(row, ln):
+            continue
+        for seat in (ln['primary'], ln.get('backup')):
+            if not seat:
+                continue
+            email = approver(seat)
+            if email and email not in seen:
+                seen.add(email)
+                recipients.append((email, approver(seat, 'name'), labels[ln['key']]))
+    return recipients
+
+
+def process_travel_review_escalations(df_travel, client=None):
     """
-    For general travel requests past TRAVEL_ESCALATION_DAYS with incomplete approval and no prior
-    escalation, set alternate approvers (Jen/Lauren) to pending and email all four coordinators.
-    Returns (possibly updated) dataframe; persists sheet when changes occur.
+    Reminder sweep for travel forms. For each post-handover form with an unsigned line past
+    TRAVEL_ESCALATION_DAYS (then every TRAVEL_REMINDER_REPEAT_DAYS):
+      - the backup for that line becomes able to sign (Lauren for the PA line, Jen for the
+        Lead line) and its status column is set to 'pending';
+      - the primary signer and the backup are emailed.
+    Returns the (possibly updated) dataframe; writes the sheet only when something changed.
     """
     if df_travel is None or df_travel.empty:
         return df_travel
@@ -2700,52 +2928,28 @@ def process_travel_review_escalations(df_travel, client):
     if TRAVEL_ESCALATION_COL not in df.columns:
         df[TRAVEL_ESCALATION_COL] = ''
 
-    changed_indices = []
-
-    for idx in df.index:
-        row = df.loc[idx]
-        if not travel_row_needs_escalation(row):
-            continue
-        changed_indices.append(idx)
-
-        df.at[idx, TRAVEL_ESCALATION_COL] = datetime.now().strftime('%Y-%m-%d')
-
-        if not travel_general_slot1_ok(row):
-            if _travel_approval_status_norm(row.get('Lauren Approval Status')) not in ('approve', 'reject'):
-                df.at[idx, 'Lauren Approval Status'] = 'pending'
-        if not travel_general_slot2_ok(row):
-            if _travel_approval_status_norm(row.get('Jen Approval Status')) not in ('approve', 'reject'):
-                df.at[idx, 'Jen Approval Status'] = 'pending'
-
-    if not changed_indices:
+    due = [idx for idx in df.index if travel_row_needs_escalation(df.loc[idx])]
+    if not due:
         return df
 
-    df = df.fillna('')
-    try:
-        spreadsheet_travel = get_spreadsheet()
-        try:
-            worksheet_travel = spreadsheet_travel.worksheet('Travel')
-        except Exception:
-            worksheet_travel = spreadsheet_travel.add_worksheet(title='Travel', rows=1000, cols=40)
-        worksheet_travel.update([df.columns.values.tolist()] + df.values.tolist())
-        load_travel_sheet.clear()  # only the sheet just written, not every cached loader
-    except Exception:
-        pass
-
-    for idx in changed_indices:
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    sent_ok = {}
+    for idx in due:
         row = df.loc[idx]
+        first_reminder = travel_last_reminder_date(row) is None
         pdf_link = str(row.get('PDF Link', '') or '')
         traveler_name = str(row.get('Name', '') or 'Unknown')
         destination = str(row.get('Destination', '') or '')
         sub = str(row.get('Submission Date', '') or '')
-        for to_email, to_name in TRAVEL_ESCALATION_NOTIFY_EMAILS:
+        all_ok = True
+        for to_email, to_name, line_label in travel_reminder_recipients(row):
             first = (to_name.split()[0] if to_name else "there").strip()
             subj = f"GU-TAP: Travel form still needs a signature — {traveler_name}"
             body = f"""Hi {first},
 
-A travel authorization in GU-TAP is still waiting on signatures. It has been in the queue for a little over a week, so this is a quick reminder.
+A travel authorization in GU-TAP is still waiting on the {line_label} signature{' (follow-up reminder)' if not first_reminder else ''}.
 
-If it shows up for you, please open GU-TAP when you can, review the PDF, and sign with your typed name to approve (or reach out if something looks off).
+You are receiving this as the approver or the backup approver for that line. Whoever is available can open GU-TAP, review the PDF, and sign with their typed name (or reach out if something looks off).
 
 Traveler: {traveler_name}
 Destination: {destination}
@@ -2757,12 +2961,147 @@ GU-TAP: https://hrsagutap.streamlit.app/
 Thanks,
 GU-TAP
 """
-            try:
-                send_email_mailjet(to_email=to_email, subject=subj, body=body.strip())
-            except Exception:
-                pass
+            if not send_email_mailjet(to_email=to_email, subject=subj, body=body.strip()):
+                all_ok = False
+            time.sleep(0.5)
+        sent_ok[idx] = all_ok
 
+    for idx, ok in sent_ok.items():
+        row = df.loc[idx]
+        # Backups can sign from now on, whether or not every email went out.
+        for ln in travel_row_lines(row):
+            backup = ln.get('backup')
+            if backup and not travel_line_signed_prefix(row, ln):
+                bcol = seat_col(backup, 'Approval Status')
+                if bcol not in df.columns:
+                    df[bcol] = ''
+                if _travel_approval_status_norm(row.get(bcol)) not in ('approve', 'reject'):
+                    df.at[idx, bcol] = 'pending'
+        # Only record the reminder as sent when it actually went out, so a failed send
+        # is retried on the next sweep instead of silently waiting another week.
+        if ok:
+            df.at[idx, TRAVEL_ESCALATION_COL] = today_str
+
+    df = df.fillna('')
+    try:
+        worksheet_travel = get_spreadsheet().worksheet('Travel')
+        worksheet_travel.update([df.columns.values.tolist()] + df.values.tolist())
+        load_travel_sheet.clear()  # only the sheet just written, not every cached loader
+    except Exception as e:
+        st.warning(f"Travel reminder sweep could not update the sheet: {e}")
     return df
+
+
+def maybe_send_travel_reminders():
+    """Reminder sweep entry point (runs once per session from run_reminder_sweeps)."""
+    try:
+        process_travel_review_escalations(load_travel_sheet())
+    except Exception:
+        pass
+
+
+def _travel_forms_waiting_on_seat(df_travel, primary_seat):
+    """Open post-handover forms with an unsigned line whose primary signer is `primary_seat`."""
+    out = []
+    if df_travel is None or df_travel.empty:
+        return out
+    for _, row in df_travel.iterrows():
+        if not travel_row_is_new_logic(row) or travel_row_has_any_rejection(row):
+            continue
+        for ln in travel_row_lines(row):
+            if ln['primary'] == primary_seat and ln.get('backup') and not travel_line_signed_prefix(row, ln):
+                out.append(row)
+                break
+    return out
+
+
+def _notify_backup_of_handover(primary_seat, back_on, df_travel):
+    """Tell the backup they now cover this line, listing what is already waiting."""
+    backup = OOO_BACKUP_SEAT[primary_seat]
+    waiting = _travel_forms_waiting_on_seat(df_travel, primary_seat)
+    lines = "\n".join(
+        f"- {r.get('Name', '')} | {r.get('Destination', '')} | departs {r.get('Departure Date', '')} | {r.get('PDF Link', '')}"
+        for r in waiting
+    ) or "- (nothing waiting right now)"
+    first = (approver(backup, 'name').split() or ['there'])[0]
+    body = f"""Hi {first},
+
+{approver(primary_seat, 'name')} is out of office{f" until {back_on.strftime('%Y-%m-%d')}" if back_on else ""}, so travel authorization forms that need their signature are now routed to you in GU-TAP.
+
+Forms currently waiting:
+{lines}
+
+GU-TAP: https://hrsagutap.streamlit.app/
+
+Thanks,
+GU-TAP
+"""
+    return send_email_mailjet(
+        to_email=approver(backup),
+        subject=f"GU-TAP: You're covering travel approvals for {approver(primary_seat, 'name')}",
+        body=body.strip(),
+    )
+
+
+def render_out_of_office_panel(my_seat, is_admin, df_travel):
+    """Out-of-office switch for Alexis / Kemisha (and the admin), plus a cover notice for backups."""
+    manageable = [s for s in OOO_BACKUP_SEAT if s == my_seat or is_admin]
+    covering = [s for s, b in OOO_BACKUP_SEAT.items() if b == my_seat and seat_is_out(s)]
+    for seat in covering:
+        back = (load_out_of_office().get(seat) or {}).get('back_on') or ''
+        st.warning(
+            f"🧳 {approver(seat, 'name')} is out of office{f' (back on {back})' if back else ''}. "
+            f"You're covering their travel approvals — they appear in your queue below."
+        )
+    if not manageable:
+        return
+    with st.container(border=True):
+        st.markdown("##### 🏖️ Out of office")
+        st.caption(
+            "While a signer is marked out, new and waiting travel forms go to their backup "
+            f"(Program Assistant → {approver('alternate_pa', 'name')}; "
+            f"Lead TA → {approver('director', 'name')}). "
+            "Set a 'Back on' date and the cover ends automatically that day."
+        )
+        for seat in manageable:
+            backup = OOO_BACKUP_SEAT[seat]
+            info = load_out_of_office().get(seat) or {}
+            out_now = seat_is_out(seat)
+            back_val = pd.to_datetime(info.get('back_on') or None, errors='coerce')
+            c1, c2, c3 = st.columns([2.2, 1.6, 1])
+            with c1:
+                flag = st.checkbox(
+                    f"{approver(seat, 'name')} is out — {approver(backup, 'name')} covers",
+                    value=out_now,
+                    key=f"ooo_flag_{seat}",
+                )
+            with c2:
+                back_on = st.date_input(
+                    "Back on (optional)",
+                    value=back_val.date() if pd.notna(back_val) else None,
+                    min_value=datetime.now().date(),
+                    key=f"ooo_back_{seat}",
+                )
+            with c3:
+                st.write("")
+                save = st.button("Save", key=f"ooo_save_{seat}", use_container_width=True)
+            if save:
+                try:
+                    save_out_of_office(
+                        seat, flag, back_on,
+                        st.session_state.get('user_display_name') or st.session_state.get('user_email', ''),
+                    )
+                    if flag and not out_now:
+                        if _notify_backup_of_handover(seat, back_on, df_travel):
+                            st.success(f"Saved. {approver(backup, 'name')} was emailed that they're covering.")
+                        else:
+                            st.warning(f"Saved, but the email to {approver(backup, 'name')} did not go out.")
+                    else:
+                        st.success("Saved.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save out-of-office status: {e}")
 
 
 def gsa_exemption_approver_routing():
@@ -2771,26 +3110,26 @@ def gsa_exemption_approver_routing():
     Jen = Program Director row; Kemisha = Technical Assistance Lead row in the PDF.
     """
     return {
-        'approver1_email': 'jenevieve.opoku@georgetown.edu',
-        'approver1_name': 'Jenevieve Opoku',
-        'approver1_status_col': 'Jen Approval Status',
-        'approver2_email': 'kd802@georgetown.edu',
-        'approver2_name': 'Kemisha Denny',
-        'approver2_status_col': 'Kemisha Approval Status',
+        'approver1_email': approver('director'),
+        'approver1_name': approver('director', 'name'),
+        'approver1_status_col': 'Director Approval Status',
+        'approver2_email': approver('lead_ta'),
+        'approver2_name': approver('lead_ta', 'name'),
+        'approver2_status_col': 'Lead TA Approval Status',
     }
 
 
 def _status_col_to_gsa_pdf_keys(status_col):
     """Map sheet-style status column to create_gsa_exemption_pdf form_data keys."""
+    # Seat-named columns ('Director ...', 'Lead TA ...'). The old person-name checks
+    # ('Jen' / 'Kemisha') never matched these, so both GSA signature rows came out blank.
     if not status_col:
-        return 'lauren_signature', 'lauren_approval_date'
-    if 'Jen' in status_col:
-        return 'jen_signature', 'jen_approval_date'
-    if 'Kemisha' in status_col:
-        return 'kemisha_signature', 'kemisha_approval_date'
-    if 'Lauren' in status_col:
-        return 'lauren_signature', 'lauren_approval_date'
-    return 'lauren_signature', 'lauren_approval_date'
+        return 'pa_signature', 'pa_approval_date'
+    if status_col.startswith('Director') or 'Jen' in status_col:
+        return 'director_signature', 'director_approval_date'
+    if status_col.startswith('Lead TA') or 'Kemisha' in status_col:
+        return 'lead_signature', 'lead_approval_date'
+    return 'pa_signature', 'pa_approval_date'
 
 
 def gsa_approver_routing_for_traveler(traveler_name, traveler_email=''):
@@ -2813,18 +3152,18 @@ def gsa_approver_routing_for_traveler(traveler_name, traveler_email=''):
 def gsa_blank_approval_columns():
     """Same approval-related columns as Travel worksheet rows."""
     return {
-        'Kemisha Approval Status': '',
-        'Jen Approval Status': '',
-        'Lauren Approval Status': '',
-        'Kemisha Approval Date': '',
-        'Jen Approval Date': '',
-        'Lauren Approval Date': '',
-        'Kemisha Signature': '',
-        'Jen Signature': '',
-        'Lauren Signature': '',
-        'Kemisha Note': '',
-        'Jen Note': '',
-        'Lauren Note': '',
+        'Lead TA Approval Status': '',
+        'Director Approval Status': '',
+        'Program Assistant Approval Status': '',
+        'Lead TA Approval Date': '',
+        'Director Approval Date': '',
+        'Program Assistant Approval Date': '',
+        'Lead TA Signature': '',
+        'Director Signature': '',
+        'Program Assistant Signature': '',
+        'Lead TA Note': '',
+        'Director Note': '',
+        'Program Assistant Note': '',
     }
 
 
@@ -2845,7 +3184,8 @@ GSA_EXEMPTION_FRONT_COLUMNS = [
     'Requester Signature',
     'Submission Date',
 ]
-GSA_REMINDER_DAYS = 7
+GSA_REMINDER_DAYS = 7          # first reminder once a form is this old
+GSA_REMINDER_REPEAT_DAYS = 7   # then again every N days until signed
 GSA_REMINDER_LAST_SENT_COL = 'GSA Reminder Last Sent'
 
 
@@ -2956,12 +3296,12 @@ def gsa_sheet_row_to_pdf_form_data(row_dict):
         'submission_date': row.get('Submission Date', '') or '',
         'supporting_drive_links': supporting,
         'supporting_materials': '',
-        'jen_signature': str(row.get('Jen Signature', '') or ''),
-        'kemisha_signature': str(row.get('Kemisha Signature', '') or ''),
-        'lauren_signature': str(row.get('Lauren Signature', '') or ''),
-        'jen_approval_date': str(row.get('Jen Approval Date', '') or ''),
-        'kemisha_approval_date': str(row.get('Kemisha Approval Date', '') or ''),
-        'lauren_approval_date': str(row.get('Lauren Approval Date', '') or ''),
+        'director_signature': str(row.get('Director Signature', '') or ''),
+        'lead_signature': str(row.get('Lead TA Signature', '') or ''),
+        'pa_signature': str(row.get('Program Assistant Signature', '') or ''),
+        'director_approval_date': str(row.get('Director Approval Date', '') or ''),
+        'lead_approval_date': str(row.get('Lead TA Approval Date', '') or ''),
+        'pa_approval_date': str(row.get('Program Assistant Approval Date', '') or ''),
     }
     return fd
 
@@ -3422,8 +3762,8 @@ def regenerate_gsa_pdf_to_drive(pdf_link, row_dict, creds_dict, folder_id_pdf):
         f"{row_dict.get('Requester Name') or row_dict.get('Requestor Name', '')}_"
         f"{row_dict.get('Traveler Name(s)', '')}_{row_dict.get('Travel City/State', '')}",
     )[:120]
-    a1 = str(row_dict.get('Jen Approval Status', '') or '').lower()
-    a2 = str(row_dict.get('Kemisha Approval Status', '') or '').lower()
+    a1 = str(row_dict.get('Director Approval Status', '') or '').lower()
+    a2 = str(row_dict.get('Lead TA Approval Status', '') or '').lower()
     both_done = a1 == 'approve' and a2 == 'approve'
     filename = (
         f"GSA_Lodging_Exemption_Approved_{safe_ap}.pdf"
@@ -3625,33 +3965,35 @@ df_support = load_support_sheet()
 
 @st.cache_data(ttl=600)
 def load_travel_sheet():
-    return pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'Travel'))
+    return normalize_approval_columns(
+        pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'Travel'))
+    )
 
 @st.cache_data(ttl=600)
 def load_gsa_exemption_sheet():
     try:
         df = pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'GSA_exemption'))
-        return normalize_gsa_exemption_dataframe(df)
+        return normalize_approval_columns(normalize_gsa_exemption_dataframe(df))
     except Exception:
         return pd.DataFrame()
 
 
 def gsa_row_still_pending_approval(row):
     """True when Jen/Kemisha have not both approved and neither has rejected."""
-    jen = _travel_approval_status_norm(row.get('Jen Approval Status'))
-    kem = _travel_approval_status_norm(row.get('Kemisha Approval Status'))
+    jen = _travel_approval_status_norm(row.get('Director Approval Status'))
+    kem = _travel_approval_status_norm(row.get('Lead TA Approval Status'))
     if jen == 'reject' or kem == 'reject':
         return False
     if jen == 'approve' and kem == 'approve':
         return False
     return (
-        _travel_needs_action(row.get('Jen Approval Status'))
-        or _travel_needs_action(row.get('Kemisha Approval Status'))
+        _travel_needs_action(row.get('Director Approval Status'))
+        or _travel_needs_action(row.get('Lead TA Approval Status'))
     )
 
 
-# GSA Lodging Exemption needs both signatures (Jen Approval Status + Kemisha Approval Status) and no rejection.
-GSA_APPROVER_STATUS_COLS = ('Jen Approval Status', 'Kemisha Approval Status')
+# GSA Lodging Exemption needs both signatures (Director Approval Status + Lead TA Approval Status) and no rejection.
+GSA_APPROVER_STATUS_COLS = ('Director Approval Status', 'Lead TA Approval Status')
 
 
 def gsa_row_fully_approved(row):
@@ -3663,22 +4005,31 @@ def gsa_row_fully_approved(row):
 
 
 def maybe_send_gsa_exemption_reminders():
-    """Email Jen and Kemisha when a GSA exemption is pending approval for more than GSA_REMINDER_DAYS. At most once per request per calendar day (tracked in GSA Reminder Last Sent)."""
+    """
+    Remind Jen / Kemisha about a GSA exemption still waiting on THEIR signature.
+
+    First reminder once the form is GSA_REMINDER_DAYS old, then every
+    GSA_REMINDER_REPEAT_DAYS until signed (tracked in GSA Reminder Last Sent). Only the
+    approver(s) who have not signed are emailed.
+    """
     today = datetime.today().date()
     today_str = today.strftime('%Y-%m-%d')
     try:
         df = pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'GSA_exemption'))
-        df = normalize_gsa_exemption_dataframe(df)
+        # Same normalization as the review screen. Without it, a sheet that still has the
+        # person-named headers ('Jen Approval Status', ...) looks unsigned and every old,
+        # already-approved form would be re-sent as "pending".
+        df = normalize_approval_columns(normalize_gsa_exemption_dataframe(df))
     except Exception:
         return
-    if df.empty:
+    if df is None or df.empty:
         return
     if GSA_REMINDER_LAST_SENT_COL not in df.columns:
         df[GSA_REMINDER_LAST_SENT_COL] = ''
     route = gsa_exemption_approver_routing()
-    notify = [
-        (route['approver1_email'], route['approver1_name']),
-        (route['approver2_email'], route['approver2_name']),
+    approvers_gsa = [
+        (route['approver1_email'], route['approver1_name'], route['approver1_status_col']),
+        (route['approver2_email'], route['approver2_name'], route['approver2_status_col']),
     ]
     sheet_updated = False
     for idx, row in df.iterrows():
@@ -3689,8 +4040,14 @@ def maybe_send_gsa_exemption_reminders():
             continue
         if (today - sub_d).days < GSA_REMINDER_DAYS:
             continue
-        last = str(row.get(GSA_REMINDER_LAST_SENT_COL, '') or '').strip()
-        if last == today_str:
+        last = _travel_sheet_date_to_date(row.get(GSA_REMINDER_LAST_SENT_COL))
+        if last is not None and (today - last).days < GSA_REMINDER_REPEAT_DAYS:
+            continue
+        notify = [
+            (e, n) for e, n, col in approvers_gsa
+            if _travel_approval_status_norm(row.get(col)) != 'approve'
+        ]
+        if not notify:
             continue
         traveler = str(row.get('Traveler Name(s)', '') or 'Unknown')
         requester = str(row.get('Requester Name', '') or row.get('Requestor Name', '') or '')
@@ -3698,15 +4055,15 @@ def maybe_send_gsa_exemption_reminders():
         dates = str(row.get('Dates of Travel', '') or '')
         pdf_link = str(row.get('PDF Link', '') or '')
         sub = str(row.get('Submission Date', '') or '')
-        jen_st = str(row.get('Jen Approval Status', '') or 'pending')
-        kem_st = str(row.get('Kemisha Approval Status', '') or 'pending')
+        dir_st = str(row.get('Director Approval Status', '') or 'pending')
+        lead_st = str(row.get('Lead TA Approval Status', '') or 'pending')
         all_ok = True
         for i, (to_email, to_name) in enumerate(notify):
             first = (to_name.split()[0] if to_name else 'there').strip()
             subj = f"GU-TAP: GSA Lodging Exemption still pending — {traveler}"
             body = f"""Hi {first},
 
-This is an automated reminder: a GSA Lodging Rate Exemption form has been pending approval for more than {GSA_REMINDER_DAYS} days.
+This is an automated reminder: a GSA Lodging Rate Exemption form has been waiting on your signature for more than {GSA_REMINDER_DAYS} days.
 
 Please open GU-TAP when you can, review the PDF, and sign with your typed name to approve (or reach out if something looks off).
 
@@ -3715,8 +4072,8 @@ Traveler(s): {traveler}
 City/State: {city}
 Dates of travel: {dates}
 Submitted: {sub}
-Jen Approval Status: {jen_st}
-Kemisha Approval Status: {kem_st}
+{approver('director', 'name')} (Program Director): {dir_st}
+{approver('lead_ta', 'name')} (TA Lead): {lead_st}
 PDF: {pdf_link if pdf_link else "(open the form in GU-TAP to view it)"}
 
 GU-TAP: https://hrsagutap.streamlit.app/
@@ -3737,7 +4094,7 @@ GU-TAP
             sheet_updated = True
     if sheet_updated:
         try:
-            df_out = df.fillna('')
+            df_out = reorder_gsa_exemption_dataframe(df.fillna(''))
             spreadsheet_gsa = get_spreadsheet()
             worksheet_gsa = spreadsheet_gsa.worksheet('GSA_exemption')
             worksheet_gsa.update([df_out.columns.values.tolist()] + df_out.values.tolist())
@@ -3890,7 +4247,7 @@ REMINDER_SWEEP_FLAG = '_reminder_sweeps_done'
 
 def run_reminder_sweeps():
     """
-    Run the three reminder sweeps at most once per session.
+    Run the reminder sweeps at most once per session.
 
     Streamlit re-executes the whole script on every widget interaction, and each sweep
     reads a full worksheet directly (bypassing the cached loaders). Running them on
@@ -3904,6 +4261,7 @@ def run_reminder_sweeps():
     for sweep in (
         maybe_send_ga_unassigned_reminders,
         maybe_send_gsa_exemption_reminders,
+        maybe_send_travel_reminders,
         maybe_send_ta_due_date_reminders,
     ):
         try:
@@ -4436,7 +4794,9 @@ else:
                 user_info = USERS.get(st.session_state.user_email)
                 coordinator_name = user_info["Coordinator"]["name"]
                 # Check if current coordinator is Lauren (only sees Travel Authorization Review Center)
-                is_lauren_coordinator = st.session_state.user_email == "lm1353@georgetown.edu"
+                is_lauren_coordinator = st.session_state.user_email in (
+                    approver('program_assistant'), approver('alternate_pa')
+                )
                 gutap_dashboard_header("📬 Coordinator Dashboard", kicker="Coordinator workspace")
                 if user_info and "Coordinator" in user_info:
                     gutap_welcome_strip(coordinator_name)
@@ -4526,7 +4886,7 @@ else:
                                 st.info("No requests with coming dues to show.")
 
 
-                        staff_list = ["Jenevieve Opoku", "Kemisha Denny", "Katherine Robsky", "Jiaqin Wu", 
+                        staff_list = [approver('director', 'name'), approver('lead_ta', 'name'), "Katherine Robsky", "Jiaqin Wu", 
                         "Kiah Moorehead","Vanessa Da Costa","Abby Jordan","Megan Highland","Jesus Hernandez Burgos",
                         "Samantha Cinnick","Tara Hixson","Dzifa Awunyo-Akaba","Masill Miranda","Joy Berry","Ashley Clonchmore",
                         "Grace Hazlett","Lauren Wagner"]
@@ -5533,17 +5893,20 @@ else:
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 with st.expander("✈️ **REVIEW & APPROVE TRAVEL AUTHORIZATION FORMS**"):
-                    # Check access control
+                    # Check access control — everyone is identified by the approval SEAT they hold.
                     current_coordinator_email = st.session_state.user_email
-                    is_kemisha = current_coordinator_email == "kd802@georgetown.edu"
-                    is_jen = current_coordinator_email == "jenevieve.opoku@georgetown.edu"
-                    is_lauren = current_coordinator_email == "lm1353@georgetown.edu"
-                    is_jiaqin = current_coordinator_email == "jw2104@georgetown.edu"
-                    
-                    can_view_travel_review = is_kemisha or is_jen or is_lauren or is_jiaqin
-                    # GSA exemption review: Jen + Kemisha sign; Lauren and Jiaqin are read-only oversight.
-                    can_view_gsa_exemption_review = is_kemisha or is_jen or is_lauren or is_jiaqin
-                    
+                    my_seat = seat_for_email(current_coordinator_email)
+                    is_kemisha = my_seat == 'lead_ta'
+                    is_jen = my_seat == 'director'
+                    is_alexis = my_seat == 'program_assistant'
+                    is_lauren = my_seat == 'alternate_pa'
+                    is_jiaqin = current_coordinator_email == TA_DUE_CONTACT_EMAIL
+
+                    can_view_travel_review = bool(my_seat) or is_jiaqin
+                    # GSA exemption review: Jen + Kemisha sign; Alexis and Jiaqin get a read-only
+                    # view. Lauren is not part of the GSA workflow.
+                    can_view_gsa_exemption_review = is_kemisha or is_jen or is_alexis or is_jiaqin
+
                     if not can_view_travel_review:
                         st.info("This section is not available to you.")
                     else:
@@ -5558,50 +5921,29 @@ else:
                         try:
                             df_travel_review = load_travel_sheet()
                             df_travel_review = process_travel_review_escalations(df_travel_review, client)
-                            
-                            # Access control: Only Jen, Kemisha, Lauren, and Jiaqincan view this section
-                            if not (is_kemisha or is_jen or is_lauren or is_jiaqin):
-                                st.info("This section is only available for Kemisha Denny, Jenevieve Opoku, Lauren Mathae, and Jiaqin Wu.")
+
+                            render_out_of_office_panel(my_seat, is_jiaqin, df_travel_review)
+
+                            # Routing (see travel_required_lines):
+                            # - Staff requests   -> Alexis (PA line) + Kemisha (Lead line)
+                            #     Alexis out -> Lauren signs the PA line; Kemisha out -> Jen signs the Lead line.
+                            #     After 7 days unsigned, the backups can sign too and everyone is reminded.
+                            # - Kemisha's own    -> PA line + Jen
+                            # - Alexis/Lauren's own -> Jen + Kemisha
+                            if my_seat:
+                                status_col = seat_col(my_seat, 'Approval Status')
+                                approval_date_col = seat_col(my_seat, 'Approval Date')
+                                signature_col = seat_col(my_seat, 'Signature')
+                                note_col = seat_col(my_seat, 'Note')
+                                coordinator_display_name = approver(my_seat, 'name')
                             else:
-                                # Determine status column based on coordinator
-                                # Note: Approval routing is dynamic based on traveler:
-                                # - Kemisha's requests → Lauren + Jen
-                                # - Lauren's requests → Jen + Kemisha
-                                # - Others → Lauren + Kemisha first; after 7 days, Lauren / Jen may cover each line
-                                if is_kemisha:
-                                    status_col = 'Kemisha Approval Status'
-                                    approval_date_col = 'Kemisha Approval Date'
-                                    signature_col = 'Kemisha Signature'
-                                    note_col = 'Kemisha Note'
-                                    coordinator_display_name = "Kemisha Denny"
-                                elif is_jen:
-                                    status_col = 'Jen Approval Status'
-                                    approval_date_col = 'Jen Approval Date'
-                                    signature_col = 'Jen Signature'
-                                    note_col = 'Jen Note'
-                                    coordinator_display_name = "Jenevieve Opoku"
-                                elif is_lauren:
-                                    status_col = 'Lauren Approval Status'
-                                    approval_date_col = 'Lauren Approval Date'
-                                    signature_col = 'Lauren Signature'
-                                    note_col = 'Lauren Note'
-                                    coordinator_display_name = "Lauren Mathae"
-                                elif is_jiaqin:
-                                    # Jiaqin can view but needs to determine which column based on form routing
-                                    # For now, default to Kemisha column, but will be filtered by actual routing
-                                    status_col = 'Kemisha Approval Status'
-                                    approval_date_col = 'Kemisha Approval Date'
-                                    signature_col = 'Kemisha Signature'
-                                    note_col = 'Kemisha Note'
-                                    coordinator_display_name = "Jiaqin Wu"
-                                else:
-                                    # Fallback (shouldn't reach here due to access control)
-                                    status_col = 'Lauren Approval Status'
-                                    approval_date_col = 'Lauren Approval Date'
-                                    signature_col = 'Lauren Signature'
-                                    note_col = 'Lauren Note'
-                                    coordinator_display_name = "Lauren Mathae"
-                            
+                                # Jiaqin: oversight only — nothing is routed to her.
+                                status_col = 'Lead TA Approval Status'
+                                approval_date_col = 'Lead TA Approval Date'
+                                signature_col = 'Lead TA Signature'
+                                note_col = 'Lead TA Note'
+                                coordinator_display_name = "Jiaqin Wu"
+
                             # Filter for forms pending this coordinator's approval
                             # First, determine which forms are routed to this coordinator based on traveler
                             pending_forms = df_travel_review.copy()
@@ -5612,61 +5954,17 @@ else:
                                 ].copy()
                             # Filter forms that are routed to this coordinator
                             def is_routed_to_coordinator(row):
-                                """Check if form is routed to current coordinator"""
+                                """An unsigned line on this form is this seat's to sign right now."""
                                 # Pre-handover requests are frozen — they never appear as pending
                                 # work. They show up under "Fully Approved Forms" instead.
-                                if not travel_row_is_new_logic(row):
+                                if not travel_row_is_new_logic(row) or not my_seat:
                                     return False
-                                traveler_name_check = str(row.get('Name', '')).lower()
-                                traveler_email_check = str(row.get('Email', '')).lower()
-                                
-                                is_kemisha_traveler = (traveler_email_check == 'kd802@georgetown.edu' or 
-                                                      'kemisha' in traveler_name_check)
-                                is_lauren_traveler = (traveler_email_check == 'lm1353@georgetown.edu' or 
-                                                     'lauren mathae' in traveler_name_check)
-                                
-                                # Determine routing based on traveler
-                                if is_kemisha_traveler:
-                                    # Kemisha's requests → Lauren + Jen
-                                    if is_lauren:
-                                        return status_col == 'Lauren Approval Status'
-                                    elif is_jen:
-                                        return status_col == 'Jen Approval Status'
-                                    else:
-                                        return False
-                                elif is_lauren_traveler:
-                                    # Lauren's requests → Kemisha + Jen
-                                    if is_kemisha:
-                                        return status_col == 'Kemisha Approval Status'
-                                    elif is_jen:
-                                        return status_col == 'Jen Approval Status'
-                                    else:
-                                        return False
-                                else:
-                                    # General travelers: Lauren + Kemisha first; after escalation, Lauren / Jen alternate lines
-                                    escalated = travel_escalation_applied(row)
-                                    slot1_ok = travel_general_slot1_ok(row)
-                                    slot2_ok = travel_general_slot2_ok(row)
-                                    if is_lauren:
-                                        return (
-                                            status_col == 'Lauren Approval Status'
-                                            and (not slot1_ok)
-                                            and _travel_needs_action(row.get('Lauren Approval Status'))
-                                        )
-                                    if is_kemisha:
-                                        return (
-                                            status_col == 'Kemisha Approval Status'
-                                            and (not slot2_ok)
-                                            and _travel_needs_action(row.get('Kemisha Approval Status'))
-                                        )
-                                    if is_jen:
-                                        return (
-                                            escalated
-                                            and status_col == 'Jen Approval Status'
-                                            and (not slot2_ok)
-                                            and _travel_needs_action(row.get('Jen Approval Status'))
-                                        )
-                                    return False
+                                for ln in travel_row_lines(row):
+                                    if travel_line_signed_prefix(row, ln):
+                                        continue
+                                    if travel_seat_can_act_on_line(row, ln, my_seat):
+                                        return _travel_needs_action(row.get(status_col))
+                                return False
                             
                             # Filter by routing
                             if len(pending_forms) > 0:
@@ -5703,8 +6001,8 @@ else:
                                     display_cols.append(TRAVEL_ESCALATION_COL)
                                 # Add approval status columns that exist
                                 # Legacy rows never reach this queue, so the Mabintou column is omitted here.
-                                approval_status_cols = ['Lauren Approval Status', 'Kemisha Approval Status',
-                                                       'Jen Approval Status']
+                                approval_status_cols = ['Program Assistant Approval Status', 'Lead TA Approval Status',
+                                                       'Director Approval Status']
                                 for col in approval_status_cols:
                                     if col in pending_forms.columns:
                                         display_cols.append(col)
@@ -5741,16 +6039,18 @@ else:
                                         st.markdown(f"**Submitted:** {selected_form.get('Submission Date', 'N/A')}")
                                     
                                     # Show approval status (all coordinator lines)
-                                    kemisha_status = selected_form.get('Kemisha Approval Status', '')
-                                    jen_status = selected_form.get('Jen Approval Status', '')
-                                    lauren_status = selected_form.get('Lauren Approval Status', '')
+                                    kemisha_status = selected_form.get('Lead TA Approval Status', '')
+                                    jen_status = selected_form.get('Director Approval Status', '')
+                                    lauren_status = selected_form.get('Program Assistant Approval Status', '')
                                     def _disp(s):
                                         if pd.isna(s) or str(s).lower() == 'nan' or str(s).strip() == '':
                                             return '—'
                                         return str(s).strip()
                                     st.markdown(
-                                        f"**Approval status:** Lauren: `{_disp(lauren_status)}` · "
-                                        f"Kemisha: `{_disp(kemisha_status)}` · Jen: `{_disp(jen_status)}`"
+                                        f"**Approval status:** Program Assistant ({approver('program_assistant', 'name')}"
+                                        f" / backup {approver('alternate_pa', 'name')}): `{_disp(lauren_status)}` · "
+                                        f"Lead TA ({approver('lead_ta', 'name')}): `{_disp(kemisha_status)}` · "
+                                        f"Director ({approver('director', 'name')}): `{_disp(jen_status)}`"
                                     )
                                     
                                     # Display PDF link
@@ -5901,230 +6201,19 @@ else:
                                                     
                                                     worksheet_travel.update([updated_df_travel.columns.values.tolist()] + updated_df_travel.values.tolist())
                                                     
-                                                    # Determine which status columns to check based on form routing
-                                                    # Check traveler to determine routing
-                                                    traveler_name_check = selected_form.get('Name', '').lower()
-                                                    traveler_email_check = selected_form.get('Email', '').lower()
-                                                    
-                                                    is_kemisha_traveler_check = (traveler_email_check == 'kd802@georgetown.edu' or 
-                                                                                'kemisha' in traveler_name_check)
-                                                    is_lauren_traveler_check = (traveler_email_check == 'lm1353@georgetown.edu' or 
-                                                                                 'lauren mathae' in traveler_name_check)
-                                                    
-                                                    # Determine if all required approvals are complete (two lines on the PDF)
+                                                    # Is every required line now signed? Routing-aware (see travel_required_lines), so a
+                                                    # single Director signature can no longer complete a staff form on its own.
                                                     row_after = updated_df_travel.loc[selected_form_idx]
-                                                    
-                                                    if is_kemisha_traveler_check:
-                                                        approver1_status_col_check = 'Lauren Approval Status'
-                                                        approver2_status_col_check = 'Jen Approval Status'
-                                                        approver1_sig_col = 'Lauren Signature'
-                                                        approver2_sig_col = 'Jen Signature'
-                                                        approver1_date_col = 'Lauren Approval Date'
-                                                        approver2_date_col = 'Jen Approval Date'
-                                                        approver1_name_final = "Lauren Mathae"
-                                                        approver2_name_final = "Jenevieve Opoku"
-                                                        for col in [approver1_status_col_check, approver2_status_col_check]:
-                                                            if col not in updated_df_travel.columns:
-                                                                updated_df_travel[col] = ''
-                                                        a1s = str(row_after.get(approver1_status_col_check, '') or '').lower()
-                                                        a2s = str(row_after.get(approver2_status_col_check, '') or '').lower()
-                                                        approvals_complete = a1s == 'approve' and a2s == 'approve'
-                                                    elif is_lauren_traveler_check:
-                                                        approver1_status_col_check = 'Kemisha Approval Status'
-                                                        approver2_status_col_check = 'Jen Approval Status'
-                                                        approver1_sig_col = 'Kemisha Signature'
-                                                        approver2_sig_col = 'Jen Signature'
-                                                        approver1_date_col = 'Kemisha Approval Date'
-                                                        approver2_date_col = 'Jen Approval Date'
-                                                        approver1_name_final = "Kemisha Denny"
-                                                        approver2_name_final = "Jenevieve Opoku"
-                                                        for col in [approver1_status_col_check, approver2_status_col_check]:
-                                                            if col not in updated_df_travel.columns:
-                                                                updated_df_travel[col] = ''
-                                                        a1s = str(row_after.get(approver1_status_col_check, '') or '').lower()
-                                                        a2s = str(row_after.get(approver2_status_col_check, '') or '').lower()
-                                                        approvals_complete = a1s == 'approve' and a2s == 'approve'
-                                                    else:
-                                                        # General: (Lauren or Jen) + (Kemisha or Jen)
-                                                        approvals_complete = travel_general_fully_approved(row_after)
-                                                        approver1_name_final = ""
-                                                        approver2_name_final = ""
-                                                    
+                                                    approvals_complete = travel_row_fully_approved(row_after)
+
                                                     if approvals_complete:
                                                         # All required lines approved — generate final PDF with both signatures and send to traveler
                                                         try:
-                                                            if is_kemisha_traveler_check:
-                                                                approver1_sig_col = 'Lauren Signature'
-                                                                approver2_sig_col = 'Jen Signature'
-                                                                approver1_date_col = 'Lauren Approval Date'
-                                                                approver2_date_col = 'Jen Approval Date'
-                                                                approver1_sig = updated_df_travel.loc[selected_form_idx, approver1_sig_col] if approver1_sig_col in updated_df_travel.columns else ''
-                                                                approver2_sig = updated_df_travel.loc[selected_form_idx, approver2_sig_col] if approver2_sig_col in updated_df_travel.columns else ''
-                                                                approver1_date = updated_df_travel.loc[selected_form_idx, approver1_date_col] if approver1_date_col in updated_df_travel.columns else ''
-                                                                approver2_date = updated_df_travel.loc[selected_form_idx, approver2_date_col] if approver2_date_col in updated_df_travel.columns else ''
-                                                                lauren_sig_pdf = approver1_sig
-                                                                kemisha_sig_pdf = approver2_sig
-                                                                lauren_date = approver1_date
-                                                                kemisha_date = approver2_date
-                                                                approver1_name_final = "Lauren Mathae"
-                                                                approver2_name_final = "Jenevieve Opoku"
-                                                            elif is_lauren_traveler_check:
-                                                                approver1_sig_col = 'Kemisha Signature'
-                                                                approver2_sig_col = 'Jen Signature'
-                                                                approver1_date_col = 'Kemisha Approval Date'
-                                                                approver2_date_col = 'Jen Approval Date'
-                                                                approver1_sig = updated_df_travel.loc[selected_form_idx, approver1_sig_col] if approver1_sig_col in updated_df_travel.columns else ''
-                                                                approver2_sig = updated_df_travel.loc[selected_form_idx, approver2_sig_col] if approver2_sig_col in updated_df_travel.columns else ''
-                                                                approver1_date = updated_df_travel.loc[selected_form_idx, approver1_date_col] if approver1_date_col in updated_df_travel.columns else ''
-                                                                approver2_date = updated_df_travel.loc[selected_form_idx, approver2_date_col] if approver2_date_col in updated_df_travel.columns else ''
-                                                                lauren_sig_pdf = approver1_sig
-                                                                kemisha_sig_pdf = approver2_sig
-                                                                lauren_date = approver1_date
-                                                                kemisha_date = approver2_date
-                                                                approver1_name_final = "Kemisha Denny"
-                                                                approver2_name_final = "Jenevieve Opoku"
-                                                            else:
-                                                                r = updated_df_travel.loc[selected_form_idx]
-                                                                if _travel_approval_status_norm(r.get('Lauren Approval Status')) == 'approve':
-                                                                    lauren_sig_pdf = str(r.get('Lauren Signature', '') or '')
-                                                                    lauren_date = str(r.get('Lauren Approval Date', '') or '')
-                                                                    approver1_name_final = "Lauren Mathae"
-                                                                elif _travel_approval_status_norm(r.get('Jen Approval Status')) == 'approve':
-                                                                    # After escalation Jen may cover the Program Assistant line.
-                                                                    lauren_sig_pdf = str(r.get('Jen Signature', '') or '')
-                                                                    lauren_date = str(r.get('Jen Approval Date', '') or '')
-                                                                    approver1_name_final = "Jenevieve Opoku"
-                                                                else:
-                                                                    lauren_sig_pdf = ''
-                                                                    lauren_date = ''
-                                                                    approver1_name_final = ''
-                                                                if _travel_approval_status_norm(r.get('Kemisha Approval Status')) == 'approve':
-                                                                    kemisha_sig_pdf = str(r.get('Kemisha Signature', '') or '')
-                                                                    kemisha_date = str(r.get('Kemisha Approval Date', '') or '')
-                                                                    approver2_name_final = "Kemisha Denny"
-                                                                elif _travel_approval_status_norm(r.get('Jen Approval Status')) == 'approve':
-                                                                    kemisha_sig_pdf = str(r.get('Jen Signature', '') or '')
-                                                                    kemisha_date = str(r.get('Jen Approval Date', '') or '')
-                                                                    approver2_name_final = "Jenevieve Opoku"
-                                                                else:
-                                                                    kemisha_sig_pdf = ''
-                                                                    kemisha_date = ''
-                                                                    approver2_name_final = ''
-                                                            # Helper function to safely parse JSON from sheet
-                                                            def safe_json_loads(value, default=[], data_type='auto'):
-                                                                if pd.isna(value) or value == '' or str(value).lower() == 'nan':
-                                                                    return default
-                                                                try:
-                                                                    parsed = json.loads(str(value))
-                                                                    if isinstance(parsed, list):
-                                                                        if data_type == 'bool':
-                                                                            # Convert to boolean: True for 1, True, "true", "True", False otherwise
-                                                                            return [bool(x) if isinstance(x, bool) else (True if str(x).lower() in ['true', '1', 1] else False) for x in parsed]
-                                                                        elif data_type == 'int':
-                                                                            # Convert to integers
-                                                                            return [int(float(x)) if isinstance(x, (int, float)) or (isinstance(x, str) and x.replace('.','').replace('-','').isdigit()) else (int(x) if isinstance(x, int) else 0) for x in parsed]
-                                                                        elif data_type == 'float':
-                                                                            # Convert to floats
-                                                                            return [float(x) if isinstance(x, (int, float)) or (isinstance(x, str) and x.replace('.','').replace('-','').isdigit()) else 0.0 for x in parsed]
-                                                                        else:
-                                                                            # Auto-detect: preserve strings (especially dates), convert numbers
-                                                                            result = []
-                                                                            for x in parsed:
-                                                                                if isinstance(x, bool):
-                                                                                    result.append(x)
-                                                                                elif isinstance(x, (int, float)):
-                                                                                    result.append(float(x))
-                                                                                elif isinstance(x, str):
-                                                                                    # Preserve date strings (contain '/') and other non-numeric strings
-                                                                                    if '/' in x or '-' in x or len(x) > 10:
-                                                                                        # Likely a date or non-numeric string, preserve as-is
-                                                                                        result.append(x)
-                                                                                    elif x.replace('.','').replace('-','').isdigit():
-                                                                                        # Numeric string, convert to float
-                                                                                        result.append(float(x))
-                                                                                    else:
-                                                                                        # Other string, preserve as-is
-                                                                                        result.append(x)
-                                                                                else:
-                                                                                    result.append(x)
-                                                                            return result
-                                                                    return default
-                                                                except:
-                                                                    return default
-                                                            
-                                                            def safe_get(value, default=''):
-                                                                if pd.isna(value) or value == '' or str(value).lower() == 'nan':
-                                                                    return default
-                                                                return str(value)
-                                                            
-                                                            def safe_get_numeric(value, default=0):
-                                                                if pd.isna(value) or value == '' or str(value).lower() == 'nan':
-                                                                    return default
-                                                                try:
-                                                                    return float(value) if value else default
-                                                                except:
-                                                                    return default
-                                                            
-                                                            # Retrieve all fields from Google Sheet
-                                                            form_data_for_pdf = {
-                                                                # Basic traveler information
-                                                                'name': safe_get(selected_form.get('Name', '')),
-                                                                'email': safe_get(selected_form.get('Email', '')),
-                                                                'destination': safe_get(selected_form.get('Destination', '')),
-                                                                'departure_date': safe_get(selected_form.get('Departure Date', '')),
-                                                                'return_date': safe_get(selected_form.get('Return Date', '')),
-                                                                'purpose_of_travel': safe_get(selected_form.get('Purpose of Travel', '')),
-                                                                'objective': safe_get(selected_form.get('Objective', '')),
-                                                                'attendees': safe_get(selected_form.get('Attendees', '')),
-                                                                'deliverables': safe_get(selected_form.get('Deliverables', '')),
-                                                                'support_files': safe_get(selected_form.get('Support Files', '')),
-                                                                # Traveler address information
-                                                                'address1': safe_get(selected_form.get('Address1', '')),
-                                                                'address2': safe_get(selected_form.get('Address2', '')),
-                                                                'city': safe_get(selected_form.get('City', '')),
-                                                                'state': safe_get(selected_form.get('State', '')),
-                                                                'zip': safe_get(selected_form.get('Zip', '')),
-                                                                'organization': safe_get(selected_form.get('Organization', 'Georgetown University')),
-                                                                'signature': safe_get(selected_form.get('Signature', '')),
-                                                                'signature_date': safe_get(selected_form.get('Signature Date', '')),
-                                                                # Mileage data - dates as strings, amounts as floats
-                                                                'mileage_dates': safe_json_loads(selected_form.get('Mileage Dates', '[]'), data_type='auto'),
-                                                                'mileage_amounts': safe_json_loads(selected_form.get('Mileage Amounts', '[]'), data_type='float'),
-                                                                'total_mileage': safe_get_numeric(selected_form.get('Total Mileage', 0)),
-                                                                # Expense data - dates as strings, amounts as floats
-                                                                'expense_dates': safe_json_loads(selected_form.get('Expense Dates', '[]'), data_type='auto'),
-                                                                'airfare': safe_json_loads(selected_form.get('Airfare', '[]'), data_type='float'),
-                                                                'ground_transport': safe_json_loads(selected_form.get('Ground Transport', '[]'), data_type='float'),
-                                                                'parking': safe_json_loads(selected_form.get('Parking', '[]'), data_type='float'),
-                                                                'lodging': safe_json_loads(selected_form.get('Lodging', '[]'), data_type='float'),
-                                                                'baggage': safe_json_loads(selected_form.get('Baggage', '[]'), data_type='float'),
-                                                                'misc': safe_json_loads(selected_form.get('Misc', '[]'), data_type='float'),
-                                                                'misc2': safe_json_loads(selected_form.get('Misc2', '[]'), data_type='float'),
-                                                                'misc_desc1': safe_get(selected_form.get('Misc Desc1', '')),
-                                                                'misc_desc2': safe_get(selected_form.get('Misc Desc2', '')),
-                                                                # Expense totals
-                                                                'total_airfare': safe_get_numeric(selected_form.get('Total Airfare', 0)),
-                                                                'total_ground_transport': safe_get_numeric(selected_form.get('Total Ground Transport', 0)),
-                                                                'total_parking': safe_get_numeric(selected_form.get('Total Parking', 0)),
-                                                                'total_lodging': safe_get_numeric(selected_form.get('Total Lodging', 0)),
-                                                                'total_baggage': safe_get_numeric(selected_form.get('Total Baggage', 0)),
-                                                                'total_misc': safe_get_numeric(selected_form.get('Total Misc', 0)),
-                                                                # Per diem data - dates as strings, amounts as integers, checks as booleans
-                                                                'per_diem_dates': safe_json_loads(selected_form.get('Per Diem Dates', '[]'), data_type='auto'),
-                                                                'per_diem_amounts': safe_json_loads(selected_form.get('Per Diem Amounts', '[]'), data_type='int'),
-                                                                'breakfast_checks': safe_json_loads(selected_form.get('Breakfast Checks', '[]'), data_type='bool'),
-                                                                'lunch_checks': safe_json_loads(selected_form.get('Lunch Checks', '[]'), data_type='bool'),
-                                                                'dinner_checks': safe_json_loads(selected_form.get('Dinner Checks', '[]'), data_type='bool'),
-                                                                'total_per_diem': safe_get_numeric(selected_form.get('Total Per Diem', 0)),
-                                                                'total_amount_due': safe_get_numeric(selected_form.get('Total Amount Due', 0)),
-                                                                # Coordinator signatures and dates
-                                                                # Note: lauren_signature goes to Program Assistant row, kemisha_signature goes to Lead row
-                                                                # For Kemisha's requests: Lauren (Program Assistant) + Jen (Lead)
-                                                                # For others: Lauren (Program Assistant) + Jen (Lead)
-                                                                'lauren_signature': lauren_sig_pdf,  # Goes to Program Assistant row
-                                                                'kemisha_signature': kemisha_sig_pdf,    # Goes to Lead Technical Assistance Provider row
-                                                                'kemisha_approval_date': safe_get(kemisha_date),
-                                                            }
+                                                            (_sig1, lauren_date, approver1_name_final), (_sig2, kemisha_date, approver2_name_final) = (
+                                                                travel_pdf_signature_lines(row_after)
+                                                            )
+                                                            # Same builder as 'Regenerate PDF', so both paths always carry both signatures and dates.
+                                                            form_data_for_pdf = travel_sheet_row_to_pdf_form_data(row_after)
                                                             
                                                             # Regenerate PDF with coordinator signatures
                                                             try:
@@ -6182,12 +6271,14 @@ GU-TAP System
                                                                 """
                                                                 
                                                                 try:
-                                                                    send_email_mailjet(
+                                                                    if send_email_mailjet(
                                                                         to_email=traveler_email,
                                                                         subject=final_approval_subject,
                                                                         body=final_approval_body.strip()
-                                                                    )
-                                                                    st.success("Success. The traveler has been notified.")
+                                                                    ):
+                                                                        st.success("Success. The traveler has been notified.")
+                                                                    else:
+                                                                        st.warning("⚠️ Form approved, but the email to the traveler did not go out.")
                                                                 except Exception as e:
                                                                     st.warning(f"⚠️ Form approved but failed to send email: {str(e)}")
                                                             else:
@@ -6219,51 +6310,12 @@ GU-TAP System
                                                     updated_df_travel.loc[selected_form_idx, approval_date_col] = approval_date.strftime('%Y-%m-%d')
                                                     updated_df_travel.loc[selected_form_idx, note_col] = reject_note
                                                     
-                                                    # Determine the other approver's status column and clear it
-                                                    # Check traveler to determine routing
-                                                    traveler_name_check = selected_form.get('Name', '').lower()
-                                                    traveler_email_check = selected_form.get('Email', '').lower()
-                                                    
-                                                    is_kemisha_traveler_check = (traveler_email_check == 'kd802@georgetown.edu' or 
-                                                                                'kemisha' in traveler_name_check)
-                                                    is_lauren_traveler_check = (traveler_email_check == 'lm1353@georgetown.edu' or 
-                                                                                'lauren mathae' in traveler_name_check)
-                                                    
-                                                    # Determine the other approver's status column based on routing
-                                                    other_status_col = None
-                                                    if is_kemisha_traveler_check:
-                                                        # Kemisha's requests → Lauren + Jen
-                                                        if status_col == 'Lauren Approval Status':
-                                                            other_status_col = 'Jen Approval Status'
-                                                        elif status_col == 'Jen Approval Status':
-                                                            other_status_col = 'Lauren Approval Status'
-                                                    elif is_lauren_traveler_check:
-                                                        # Lauren's requests → Kemisha + Jen
-                                                        if status_col == 'Kemisha Approval Status':
-                                                            other_status_col = 'Jen Approval Status'
-                                                        elif status_col == 'Jen Approval Status':
-                                                            other_status_col = 'Kemisha Approval Status'
-                                                    else:
-                                                        # General: PA line (Lauren / Jen); Lead line (Kemisha / Jen)
-                                                        if status_col == 'Lauren Approval Status':
-                                                            other_status_col = 'Kemisha Approval Status'
-                                                        elif status_col == 'Kemisha Approval Status':
-                                                            other_status_col = 'Lauren Approval Status'
-                                                        elif status_col == 'Jen Approval Status':
-                                                            other_status_col = 'Kemisha Approval Status'
-                                                        elif status_col == 'Lauren Approval Status':
-                                                            other_status_col = 'Jen Approval Status'
-                                                    
-                                                    # Clear the other approver's status (set to blank)
-                                                    if other_status_col and other_status_col in updated_df_travel.columns:
-                                                        updated_df_travel.loc[selected_form_idx, other_status_col] = ''
-                                                        # Also clear related columns
-                                                        other_date_col = other_status_col.replace('Status', 'Date')
-                                                        other_sig_col = other_status_col.replace('Approval Status', 'Signature')
-                                                        if other_date_col in updated_df_travel.columns:
-                                                            updated_df_travel.loc[selected_form_idx, other_date_col] = ''
-                                                        if other_sig_col in updated_df_travel.columns:
-                                                            updated_df_travel.loc[selected_form_idx, other_sig_col] = ''
+                                                    # This rejection closes the form. Any other line still waiting is cleared so the form
+                                                    # leaves the other approvers' queues; approvals already given are kept as a record.
+                                                    for _other_col in TRAVEL_APPROVER_STATUS_COLUMNS:
+                                                        if _other_col != status_col and _other_col in updated_df_travel.columns:
+                                                            if _travel_approval_status_norm(updated_df_travel.loc[selected_form_idx, _other_col]) == 'pending':
+                                                                updated_df_travel.loc[selected_form_idx, _other_col] = ''
                                                     
                                                     updated_df_travel = updated_df_travel.fillna("")
                                                     spreadsheet_travel = get_spreadsheet()
@@ -6301,12 +6353,14 @@ GU-TAP System
                                                         """
                                                         
                                                         try:
-                                                            send_email_mailjet(
+                                                            if send_email_mailjet(
                                                                 to_email=traveler_email,
                                                                 subject=rejection_subject,
                                                                 body=rejection_body.strip()
-                                                            )
-                                                            st.info("Rejection recorded. The traveler was notified.")
+                                                            ):
+                                                                st.info("Rejection recorded. The traveler was notified.")
+                                                            else:
+                                                                st.warning("⚠️ Rejection recorded, but the email to the traveler did not go out.")
                                                         except Exception as e:
                                                             st.warning(f"⚠️ Form rejected but failed to send email: {str(e)}")
                                                     else:
@@ -6333,27 +6387,8 @@ GU-TAP System
                                 # Lauren column doesn't make them look incomplete.
                                 if not travel_row_is_new_logic(row):
                                     return travel_legacy_fully_approved(row)
-                                traveler_name_check = str(row.get('Name', '')).lower()
-                                traveler_email_check = str(row.get('Email', '')).lower()
-                                
-                                is_kemisha_traveler = (traveler_email_check == 'kd802@georgetown.edu' or 
-                                                      'kemisha' in traveler_name_check)
-                                is_lauren_traveler = (traveler_email_check == 'lm1353@georgetown.edu' or 
-                                                     'lauren mathae' in traveler_name_check)
-                                
-                                if is_kemisha_traveler:
-                                    # Kemisha's requests → Lauren + Jen must both approve
-                                    lauren_status = str(row.get('Lauren Approval Status', '')).lower()
-                                    jen_status = str(row.get('Jen Approval Status', '')).lower()
-                                    return lauren_status == 'approve' and jen_status == 'approve'
-                                elif is_lauren_traveler:
-                                    # Lauren's requests → Kemisha + Jen must both approve
-                                    kemisha_status = str(row.get('Kemisha Approval Status', '')).lower()
-                                    jen_status = str(row.get('Jen Approval Status', '')).lower()
-                                    return jen_status == 'approve' and kemisha_status == 'approve'
-                                else:
-                                    # General: one approval per line — (Lauren or Jen) and (Kemisha or Jen)
-                                    return travel_general_fully_approved(row)
+                                # Routing-aware: each required line signed by its seat (or its backup).
+                                return travel_row_all_lines_signed(row)
                             
                             if len(df_travel_review) > 0:
                                 approved_mask = df_travel_review.apply(is_fully_approved, axis=1)
@@ -6367,9 +6402,9 @@ GU-TAP System
                             if not fully_approved.empty:
                                 approved_display_cols = ['Name', 'Destination', 'Departure Date', 'Return Date', 'PDF Link']
                                 # Add all approval status and date columns that exist
-                                approval_cols = ['Kemisha Approval Status', 'Mabintou Approval Status', 'Jen Approval Status', 
-                                               'Lauren Approval Status', 'Kemisha Approval Date', 'Mabintou Approval Date',
-                                               'Jen Approval Date', 'Lauren Approval Date']
+                                approval_cols = ['Lead TA Approval Status', 'Mabintou Approval Status', 'Director Approval Status', 
+                                               'Program Assistant Approval Status', 'Lead TA Approval Date', 'Mabintou Approval Date',
+                                               'Director Approval Date', 'Program Assistant Approval Date']
                                 for col in approval_cols:
                                     if col in fully_approved.columns:
                                         approved_display_cols.append(col)
@@ -6457,21 +6492,21 @@ GU-TAP System
                             if df_gsa_review.empty:
                                 st.info("No GSA exemption forms submitted yet.")
                             else:
-                                # GSA exemption: only Jen + Kemisha sign; Lauren/Jiaqin = read-only oversight
-                                if is_lauren or is_jiaqin:
+                                # GSA exemption: only Jen + Kemisha sign; Alexis/Jiaqin = read-only oversight
+                                if is_alexis or is_jiaqin:
                                     gsa_read_only = True
                                     status_col_gsa = None
                                     coordinator_display_name_gsa = (
-                                        "Lauren Mathae" if is_lauren else "Jiaqin Wu"
+                                        approver('program_assistant', 'name') if is_alexis else "Jiaqin Wu"
                                     )
                                 elif is_jen:
                                     gsa_read_only = False
-                                    status_col_gsa = 'Jen Approval Status'
-                                    coordinator_display_name_gsa = "Jenevieve Opoku"
+                                    status_col_gsa = 'Director Approval Status'
+                                    coordinator_display_name_gsa = approver('director', 'name')
                                 elif is_kemisha:
                                     gsa_read_only = False
-                                    status_col_gsa = 'Kemisha Approval Status'
-                                    coordinator_display_name_gsa = "Kemisha Denny"
+                                    status_col_gsa = 'Lead TA Approval Status'
+                                    coordinator_display_name_gsa = approver('lead_ta', 'name')
                                 else:
                                     gsa_read_only = True
                                     status_col_gsa = None
@@ -6479,14 +6514,15 @@ GU-TAP System
 
                                 if gsa_read_only:
                                     st.info(
-                                        "GSA exemption forms are signed only by **Jen** and **Kemisha**. "
+                                        f"GSA exemption forms are signed only by **{approver('director', 'name')}** "
+                                        f"and **{approver('lead_ta', 'name')}**. "
                                         "Below is a read-only view of all submitted forms."
                                     )
                                     display_cols = [
                                         c for c in df_gsa_review.columns
                                         if c in [
                                             'Requester Name', 'Traveler Name(s)', 'Travel City/State',
-                                            'Dates of Travel', 'Jen Approval Status', 'Kemisha Approval Status',
+                                            'Dates of Travel', 'Director Approval Status', 'Lead TA Approval Status',
                                             'PDF Link', 'Email', 'Submission Date',
                                         ]
                                     ]
@@ -6566,10 +6602,10 @@ GU-TAP System
                                         return True
 
                                     def get_other_approver_status_col_gsa(row):
-                                        if status_col_gsa == 'Jen Approval Status':
-                                            return 'Kemisha Approval Status'
-                                        if status_col_gsa == 'Kemisha Approval Status':
-                                            return 'Jen Approval Status'
+                                        if status_col_gsa == 'Director Approval Status':
+                                            return 'Lead TA Approval Status'
+                                        if status_col_gsa == 'Lead TA Approval Status':
+                                            return 'Director Approval Status'
                                         return None
 
                                     pending_gsa = df_gsa_review.copy()
@@ -6683,7 +6719,7 @@ GU-TAP System
                                             'Traveler Name(s)',
                                             'Travel City/State',
                                             'Dates of Travel',
-                                            'Requested Lodging Rate',
+                                            'Requested Lodfing Rate',
                                             'GSA-Approved Lodging Rate',
                                             'Excess of Applicable Rate',
                                             'Reasons',
@@ -6696,7 +6732,10 @@ GU-TAP System
                                             if not val and k == 'Requested Lodfing Rate':
                                                 val = selected_gsa.get('Requested Lodging Rate')
                                             if val:
-                                                disp = 'Email (requester)' if k == 'Email' else k
+                                                disp = {
+                                                    'Email': 'Email (requester)',
+                                                    'Requested Lodfing Rate': 'Requested Lodging Rate',
+                                                }.get(k, k)
                                                 st.write(f"- **{disp}**: {val}")
                                         pdf_link_gsa_sel = str(selected_gsa.get('PDF Link', '') or '')
                                         if pdf_link_gsa_sel:
@@ -6811,8 +6850,8 @@ GU-TAP System
                                                         ws_gsa = spreadsheet_gsa.add_worksheet(title='GSA_exemption', rows=1000, cols=40)
                                                     ws_gsa.update([updated_gsa.columns.values.tolist()] + updated_gsa.values.tolist())
 
-                                                    approver1_status_col_check = 'Jen Approval Status'
-                                                    approver2_status_col_check = 'Kemisha Approval Status'
+                                                    approver1_status_col_check = 'Director Approval Status'
+                                                    approver2_status_col_check = 'Lead TA Approval Status'
 
                                                     for col in [approver1_status_col_check, approver2_status_col_check]:
                                                         if col not in updated_gsa.columns:
@@ -6950,10 +6989,10 @@ GU-TAP System
                                                             updated_gsa[note_col_gsa_rej] = ''
                                                         updated_gsa.loc[selected_gsa_idx, note_col_gsa_rej] = reject_note_gsa.strip()
 
-                                                        if status_col_gsa == 'Jen Approval Status':
-                                                            other_status_col = 'Kemisha Approval Status'
-                                                        elif status_col_gsa == 'Kemisha Approval Status':
-                                                            other_status_col = 'Jen Approval Status'
+                                                        if status_col_gsa == 'Director Approval Status':
+                                                            other_status_col = 'Lead TA Approval Status'
+                                                        elif status_col_gsa == 'Lead TA Approval Status':
+                                                            other_status_col = 'Director Approval Status'
                                                         else:
                                                             other_status_col = None
 
@@ -7374,317 +7413,6 @@ GU-TAP System
 
                             except Exception as e:
                                 st.error(f"Error saving comment: {str(e)}")
-
-                st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-
-                # =====================================================================
-                # DEMO SECTION - "TBD" (name not decided yet)
-                # Phases & progress tracking for longer-running tickets.
-                #
-                # THIS IS A MOCK-UP. Nothing here reads from or writes to Google Sheets.
-                # Everything lives in st.session_state and disappears on logout, so the
-                # team can click through the workflow and react to it before any backend
-                # work is committed to.
-                # =====================================================================
-                with st.expander("📈 **TBD — PHASES & PROGRESS TRACKING** · demo"):
-
-                    def _h(html):
-                        """
-                        Collapse HTML to one line before handing it to st.markdown.
-
-                        Streamlit runs the string through a markdown parser first. Any
-                        line indented four or more spaces - which every line of HTML
-                        written inside this deeply nested block is - gets treated as a
-                        literal code block and printed as raw tags instead of rendering.
-                        Flattening to a single line with no leading whitespace avoids it.
-                        """
-                        return " ".join(
-                            part.strip() for part in html.split("\n") if part.strip()
-                        )
-
-                    def _md(html):
-                        st.markdown(_h(html), unsafe_allow_html=True)
-
-                    def _bar(pct, color, height=9):
-                        pct = max(0, min(100, int(pct)))
-                        return (
-                            "<div style='background:#e8eaf0;border-radius:999px;"
-                            f"height:{height}px;overflow:hidden;width:100%;'>"
-                            f"<div style='width:{pct}%;background:{color};height:100%;"
-                            "border-radius:999px;'></div></div>"
-                        )
-
-                    PHASE_STATUSES = ["Not started", "In progress", "Blocked", "Complete"]
-                    PHASE_STYLE = {
-                        "Not started": ("#94a3b8", "#f1f5f9", "⚪"),
-                        "In progress": ("#1976d2", "#e3f2fd", "🔵"),
-                        "Blocked":     ("#d32f2f", "#ffebee", "🔴"),
-                        "Complete":    ("#388e3c", "#e8f5e9", "🟢"),
-                    }
-
-                    _md("""
-                        <div style='background:linear-gradient(135deg,#1a237e 0%,#0d47a1 100%);
-                                    border-radius:18px;padding:1.6em 1.8em;margin-bottom:1.2em;
-                                    box-shadow:0 6px 22px rgba(26,35,126,.22);'>
-                          <div style='color:#fff;font-size:1.45em;font-weight:700;margin-bottom:.35em;'>
-                            📈 Phases &amp; Progress</div>
-                          <div style='color:#c5cae9;font-size:.95em;line-height:1.6;max-width:62em;'>
-                            Break a long engagement into named phases, so a month-end update can show
-                            <b style='color:#fff;'>what actually moved</b> instead of a ticket sitting
-                            at &ldquo;In Progress&rdquo; for four months.</div>
-                          <div style='display:inline-block;margin-top:1em;background:rgba(255,255,255,.14);
-                                      border:1px solid rgba(255,255,255,.25);border-radius:999px;
-                                      padding:.3em 1em;color:#fff;font-size:.78em;font-weight:600;
-                                      letter-spacing:.04em;'>DEMO · nothing is saved</div>
-                        </div>
-                    """)
-
-                    def _step(label):
-                        _md(
-                            "<div style='font-size:.72em;font-weight:700;letter-spacing:.1em;"
-                            "color:#64748b;text-transform:uppercase;margin:1.1em 0 .4em;'>"
-                            f"{label}</div>"
-                        )
-
-                    # ---- Step 1 · ticket ---------------------------------------------
-                    _step("Step 1 · Choose a ticket")
-                    try:
-                        _demo_pool = (
-                            df[(df["Assigned Coach"] == staff_name)
-                               & (df["Status"] == "In Progress")]["Ticket ID"]
-                            .dropna().astype(str).unique().tolist()
-                        )
-                    except Exception:
-                        _demo_pool = []
-                    if not _demo_pool:
-                        _demo_pool = ["GU0142 (sample)", "GU0158 (sample)"]
-
-                    demo_ticket = st.selectbox(
-                        "Ticket", _demo_pool, index=0, key="demo_phase_ticket",
-                        label_visibility="collapsed",
-                    )
-
-                    if "demo_phase_store" not in st.session_state:
-                        st.session_state.demo_phase_store = {}
-                    if demo_ticket not in st.session_state.demo_phase_store:
-                        _t = datetime.today().date()
-                        st.session_state.demo_phase_store[demo_ticket] = {
-                            "overall": 65,
-                            "note": "Dashboard build is the long pole; training is "
-                                    "scheduled but not started.",
-                            "phases": [
-                                {"name": "Scoping call + data inventory", "status": "Complete",
-                                 "start": _t - timedelta(days=96), "target": _t - timedelta(days=80),
-                                 "progress": 100,
-                                 "note": "Inventory confirmed with the jurisdiction data lead. "
-                                         "Two legacy systems ruled out of scope."},
-                                {"name": "Data sharing agreement", "status": "Complete",
-                                 "start": _t - timedelta(days=78), "target": _t - timedelta(days=40),
-                                 "progress": 100,
-                                 "note": "Signed three weeks late; legal review was the bottleneck."},
-                                {"name": "Build linkage-to-care dashboard", "status": "In progress",
-                                 "start": _t - timedelta(days=38), "target": _t + timedelta(days=12),
-                                 "progress": 55,
-                                 "note": "Three of five views built. Retention view is waiting "
-                                         "on the Q3 data refresh."},
-                                {"name": "Staff training + handoff", "status": "Not started",
-                                 "start": None, "target": _t + timedelta(days=30),
-                                 "progress": 0, "note": ""},
-                            ],
-                        }
-                    _rec = st.session_state.demo_phase_store[demo_ticket]
-                    _today_d = datetime.today().date()
-                    _done = sum(1 for p in _rec["phases"] if p["status"] == "Complete")
-                    _blocked = sum(1 for p in _rec["phases"] if p["status"] == "Blocked")
-                    _total = len(_rec["phases"])
-                    _ring = "#388e3c" if _rec["overall"] >= 75 else (
-                        "#1976d2" if _rec["overall"] >= 40 else "#f57c00")
-                    _blocked_badge = (
-                        "<span style='color:#d32f2f;font-weight:600;'>"
-                        f" · {_blocked} blocked</span>" if _blocked else ""
-                    )
-
-                    # ---- Overall summary card ----------------------------------------
-                    _md(
-                        "<div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;"
-                        "padding:1.3em 1.5em;margin:.9em 0 .4em;box-shadow:0 2px 10px rgba(0,0,0,.05);'>"
-                        "<div style='display:flex;justify-content:space-between;align-items:center;"
-                        "flex-wrap:wrap;gap:1.2em;'>"
-                        "<div style='flex:1;min-width:15em;'>"
-                        f"<div style='font-size:1.15em;font-weight:700;color:#1a237e;'>{demo_ticket}</div>"
-                        "<div style='font-size:.82em;color:#64748b;margin-top:.15em;'>"
-                        f"{_done} of {_total} phases complete{_blocked_badge}</div></div>"
-                        "<div style='flex:0 0 13em;text-align:right;'>"
-                        f"<div style='font-size:2.1em;font-weight:800;color:{_ring};line-height:1;'>"
-                        f"{_rec['overall']}<span style='font-size:.45em;font-weight:600;'>%</span></div>"
-                        "<div style='font-size:.7em;color:#64748b;letter-spacing:.08em;"
-                        "text-transform:uppercase;margin-bottom:.5em;'>overall</div>"
-                        f"{_bar(_rec['overall'], _ring, 10)}"
-                        "</div></div></div>"
-                    )
-
-                    # ---- Step 2 · overall slider -------------------------------------
-                    _step("Step 2 · Set overall progress")
-                    st.caption(
-                        "Set by hand, not averaged from the phases — three of four phases "
-                        "done rarely means 75% of the real work is done."
-                    )
-                    _c1, _c2 = st.columns([3, 2])
-                    with _c1:
-                        _rec["overall"] = st.slider(
-                            "Overall progress (%)", 0, 100, int(_rec["overall"]),
-                            step=5, key="demo_overall_slider")
-                    with _c2:
-                        _rec["note"] = st.text_area(
-                            "Progress note", value=_rec["note"], height=92,
-                            key="demo_overall_note",
-                            help="One or two lines explaining the number — this feeds "
-                                 "the month-end narrative.")
-
-                    # ---- Step 3 · phases ---------------------------------------------
-                    _step("Step 3 · Review and update phases")
-                    if not _rec["phases"]:
-                        st.info("No phases yet — add the first one below.")
-
-                    for _i, _ph in enumerate(_rec["phases"]):
-                        _col, _bg, _icon = PHASE_STYLE.get(
-                            _ph["status"], ("#94a3b8", "#f1f5f9", "⚪"))
-                        _overdue = (_ph["status"] != "Complete"
-                                    and _ph.get("target") and _ph["target"] < _today_d)
-                        _tgt = _ph["target"].strftime("%b %d, %Y") if _ph.get("target") else "—"
-                        _flag = (
-                            "<span style='background:#ffebee;color:#c62828;padding:.1em .6em;"
-                            "border-radius:999px;font-size:.72em;font-weight:700;"
-                            "margin-left:.6em;'>PAST TARGET</span>" if _overdue else ""
-                        )
-                        _md(
-                            f"<div style='background:{_bg};border-left:4px solid {_col};"
-                            "border-radius:0 12px 12px 0;padding:.9em 1.2em;margin:.8em 0 .1em;'>"
-                            "<div style='display:flex;justify-content:space-between;"
-                            "align-items:center;flex-wrap:wrap;gap:.8em;'>"
-                            "<div style='flex:1;min-width:14em;'>"
-                            "<span style='font-size:1.02em;font-weight:700;color:#1a237e;'>"
-                            f"{_icon} {_ph['name']}</span>{_flag}"
-                            "<div style='font-size:.78em;color:#546e7a;margin-top:.2em;'>"
-                            f"{_ph['status']} · target {_tgt}</div></div>"
-                            "<div style='flex:0 0 11em;'>"
-                            f"{_bar(_ph['progress'], _col, 7)}"
-                            "<div style='font-size:.72em;color:#546e7a;text-align:right;"
-                            f"margin-top:.25em;'>{_ph['progress']}%</div>"
-                            "</div></div></div>"
-                        )
-
-                        _e1, _e2, _e3 = st.columns([2, 2, 1])
-                        with _e1:
-                            _ph["status"] = st.selectbox(
-                                "Status", PHASE_STATUSES,
-                                index=PHASE_STATUSES.index(_ph["status"]),
-                                key=f"demo_ph_status_{_i}")
-                            _ph["progress"] = st.slider(
-                                "Progress (%)", 0, 100, int(_ph["progress"]),
-                                step=5, key=f"demo_ph_prog_{_i}")
-                        with _e2:
-                            _ph["start"] = st.date_input(
-                                "Start", value=_ph.get("start") or _today_d,
-                                key=f"demo_ph_start_{_i}")
-                            _ph["target"] = st.date_input(
-                                "Target", value=_ph.get("target") or _today_d,
-                                key=f"demo_ph_target_{_i}")
-                        with _e3:
-                            st.markdown("<div style='height:1.9em;'></div>",
-                                        unsafe_allow_html=True)
-                            if st.button("🗑️ Delete", key=f"demo_ph_del_{_i}",
-                                         use_container_width=True):
-                                _rec["phases"].pop(_i)
-                                st.rerun()
-                        _ph["note"] = st.text_area(
-                            "Note", value=_ph.get("note", ""), height=68,
-                            key=f"demo_ph_note_{_i}",
-                            help="Quoted in the month-end report. For a blocked phase, "
-                                 "say what is blocking it.")
-
-                    # ---- Step 4 · add -------------------------------------------------
-                    _step("Step 4 · Add a phase")
-                    st.caption(
-                        "Free text on purpose — a Data-to-Care build and a workforce "
-                        "training share almost no steps."
-                    )
-                    _a1, _a2, _a3 = st.columns([3, 2, 2])
-                    with _a1:
-                        _new_name = st.text_input(
-                            "Phase name *", key="demo_new_phase_name",
-                            placeholder="e.g. Data sharing agreement")
-                    with _a2:
-                        _new_status = st.selectbox(
-                            "Status", PHASE_STATUSES, index=0, key="demo_new_phase_status")
-                    with _a3:
-                        _new_target = st.date_input(
-                            "Target date *", value=_today_d + timedelta(days=30),
-                            key="demo_new_phase_target")
-                    _new_note = st.text_input("Note (optional)", key="demo_new_phase_note")
-                    if st.button("➕ Add phase", key="demo_add_phase", type="primary"):
-                        if not _new_name.strip():
-                            st.error("Phase name is required.")
-                        else:
-                            _rec["phases"].append({
-                                "name": _new_name.strip(), "status": _new_status,
-                                "start": _today_d if _new_status != "Not started" else None,
-                                "target": _new_target,
-                                "progress": 100 if _new_status == "Complete" else 0,
-                                "note": _new_note.strip(),
-                            })
-                            st.rerun()
-
-                    # ---- Step 5 · month-end preview -----------------------------------
-                    _step("Step 5 · What month-end would show")
-                    st.caption("No extra work at month end — the report reads whatever is here.")
-
-                    _rows = ""
-                    for _p in _rec["phases"]:
-                        _pc, _pb, _pi = PHASE_STYLE.get(
-                            _p["status"], ("#94a3b8", "#f1f5f9", "⚪"))
-                        _pt = _p["target"].strftime("%b %d, %Y") if _p.get("target") else "—"
-                        _pn = _p.get("note") or "<span style='color:#b0bec5;'>—</span>"
-                        _rows += (
-                            "<tr>"
-                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
-                            f"font-weight:600;color:#1a237e;'>{_p['name']}</td>"
-                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;'>"
-                            f"<span style='background:{_pb};color:{_pc};padding:.15em .7em;"
-                            "border-radius:999px;font-size:.78em;font-weight:700;"
-                            f"white-space:nowrap;'>{_p['status']}</span></td>"
-                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
-                            f"color:#546e7a;font-size:.85em;white-space:nowrap;'>{_pt}</td>"
-                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
-                            f"width:8em;'>{_bar(_p['progress'], _pc, 6)}</td>"
-                            "<td style='padding:.6em .8em;border-bottom:1px solid #eef1f6;"
-                            f"color:#37474f;font-size:.85em;line-height:1.5;'>{_pn}</td>"
-                            "</tr>"
-                        )
-
-                    _foot = (
-                        "<div style='padding:.9em 1.2em;background:#f8f9fa;"
-                        "border-top:1px solid #e8eaf0;color:#37474f;font-size:.88em;"
-                        f"font-style:italic;'>&ldquo;{_rec['note']}&rdquo;</div>"
-                        if _rec.get("note") else ""
-                    )
-                    _head = "".join(
-                        "<th style='padding:.55em .8em;text-align:left;font-size:.7em;"
-                        f"color:#64748b;letter-spacing:.07em;'>{_c}</th>"
-                        for _c in ("PHASE", "STATUS", "TARGET", "PROGRESS", "LATEST NOTE")
-                    )
-                    _md(
-                        "<div style='background:#fff;border:1px solid #e8eaf0;border-radius:16px;"
-                        "overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.05);margin-top:.5em;'>"
-                        "<div style='background:#f8f9fa;padding:1em 1.2em;border-bottom:1px solid #e8eaf0;'>"
-                        f"<span style='font-weight:700;color:#1a237e;'>{demo_ticket}</span>"
-                        "<span style='color:#64748b;font-size:.88em;'> — overall "
-                        f"<b style='color:{_ring};'>{_rec['overall']}%</b> · "
-                        f"{_done} of {_total} phases complete</span></div>"
-                        "<table style='width:100%;border-collapse:collapse;'>"
-                        f"<thead><tr style='background:#fafbfc;'>{_head}</tr></thead>"
-                        f"<tbody>{_rows}</tbody></table>{_foot}</div>"
-                    )
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
@@ -8989,18 +8717,18 @@ GU-TAP System
                                         'Total Per Diem': review.get('total_per_diem', 0),
                                         'Total Amount Due': review.get('total_amount_due', 0),
                                         # Approval fields (all possible approvers)
-                                        'Kemisha Approval Status': '',
-                                        'Jen Approval Status': '',
-                                        'Lauren Approval Status': '',
-                                        'Kemisha Approval Date': '',
-                                        'Jen Approval Date': '',
-                                        'Lauren Approval Date': '',
-                                        'Kemisha Signature': '',
-                                        'Jen Signature': '',
-                                        'Lauren Signature': '',
-                                        'Kemisha Note': '',
-                                        'Jen Note': '',
-                                        'Lauren Note': '',
+                                        'Lead TA Approval Status': '',
+                                        'Director Approval Status': '',
+                                        'Program Assistant Approval Status': '',
+                                        'Lead TA Approval Date': '',
+                                        'Director Approval Date': '',
+                                        'Program Assistant Approval Date': '',
+                                        'Lead TA Signature': '',
+                                        'Director Signature': '',
+                                        'Program Assistant Signature': '',
+                                        'Lead TA Note': '',
+                                        'Director Note': '',
+                                        'Program Assistant Note': '',
                                         'Travel Escalation Sent': '',
                                     }
                                     
@@ -9144,11 +8872,12 @@ Best regards,
 GU-TAP System
                                             """
                                             try:
-                                                send_email_mailjet(
+                                                if not send_email_mailjet(
                                                     to_email=approver_email,
                                                     subject=email_subject,
                                                     body=email_body.strip()
-                                                )
+                                                ):
+                                                    return False, f"⚠️ Email to {approver_name} ({approver_email}) did not go out"
                                                 return True, f"✅ Email sent successfully to {approver_name} ({approver_email})"
                                             except Exception as e:
                                                 return False, f"⚠️ Failed to send email to {approver_name}: {str(e)}"
@@ -9485,7 +9214,7 @@ GU-TAP System
                         travel_date_from = st.date_input("Travel Date From *", value=datetime.today().date(), key="gsa_travel_date_from")
                     with col4:
                         travel_date_to = st.date_input("Travel Date To *", value=datetime.today().date(), key="gsa_travel_date_to")
-                    st.markdown("The following circumstances exist to request that the traveler be reimbursed up to 150\% of the GSA-allowed Lodging Rate for lodging costs.")
+                    st.markdown("The following circumstances exist to request that the traveler be reimbursed up to 150% of the GSA-allowed Lodging Rate for lodging costs.")
                     st.markdown("**Please confirm the official GSA per diem rate for your travel destination at https://www.gsa.gov/travel/plan-book/per-diem-rates and select the corresponding rate below.**")
                     requested_lodging_rate = st.number_input("Requested Lodging Rate *", value=100, min_value=0, step=1, key="gsa_requested_lodging_rate")
                     gsa_lodging_rate = st.number_input("GSA-Approved Lodging Rate *", value=100, min_value=0, step=1, key="gsa_lodging_rate")
@@ -9586,12 +9315,12 @@ GU-TAP System
                                 'other_reason': other_reason,
                                 'supporting_drive_links': supporting_drive_links,
                                 'supporting_materials': '',
-                                'jen_signature': '',
-                                'kemisha_signature': '',
-                                'lauren_signature': '',
-                                'jen_approval_date': '',
-                                'kemisha_approval_date': '',
-                                'lauren_approval_date': '',
+                                'director_signature': '',
+                                'lead_signature': '',
+                                'pa_signature': '',
+                                'director_approval_date': '',
+                                'lead_approval_date': '',
+                                'pa_approval_date': '',
                             }
                             try:
                                 pdf_buffer = create_gsa_exemption_pdf(gsa_form_data)
@@ -9734,7 +9463,8 @@ Best regards,
 GU-TAP System
                                             """
                                                 try:
-                                                    send_email_mailjet(to_email=to_email, subject=subj, body=body.strip())
+                                                    if not send_email_mailjet(to_email=to_email, subject=subj, body=body.strip()):
+                                                        return False, f"⚠️ Email to {approver_name} ({to_email}) did not go out"
                                                     return True, f"✅ Email sent to {approver_name} ({to_email})"
                                                 except Exception as ex:
                                                     return False, f"⚠️ Failed to email {approver_name}: {str(ex)}"
