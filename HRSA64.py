@@ -6446,11 +6446,7 @@ GU-TAP System
                             
                             # Every travel form and where it stands (rejected ones included), newest first.
                             st.markdown("---")
-                            st.markdown("#### 📋 All travel forms — status (newest first)")
-                            st.caption(
-                                "A form rejected by one approver is closed and leaves everyone's queue. "
-                                "It stays here with who rejected it and why, so nothing just 'disappears'."
-                            )
+                            st.markdown("#### 📋 All travel forms — status")
                             render_status_table(
                                 build_travel_status_table(df_travel_review),
                                 key="coord_travel_status",
