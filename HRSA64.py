@@ -29,6 +29,11 @@ from PIL import Image as PILImage, ImageDraw, ImageFont, ImageChops
 import base64
 import urllib.request
 
+# pandas 3 removed DataFrame.applymap (renamed .map in 2.1). Several saves use applymap,
+# so keep it working if the host upgrades pandas.
+if not hasattr(pd.DataFrame, "applymap"):
+    pd.DataFrame.applymap = pd.DataFrame.map
+
 st.set_page_config(
     page_title="GU TAP System",
     page_icon="https://raw.githubusercontent.com/JiaqinWu/HRSA64_Dash/main/Georgetown_logo_blueRGB.png",
@@ -4103,6 +4108,244 @@ GU-TAP
             pass
 
 
+# --- Status summaries (coordinator status tables + "my forms" view for submitters) -------
+STATUS_FILTER_OPTIONS = ["All", "⏳ Waiting", "❌ Rejected", "✅ Approved"]
+# First day the current Program Assistant (Alexis) signs. Older PA-line decisions were Lauren's.
+PA_SEAT_START = datetime(2026, 10, 26).date()
+_REJECTER_TAG = re.compile(r'^\s*\[([^\]]+)\]\s*')
+
+
+def _status_date(val):
+    d = _travel_sheet_date_to_date(val)
+    return d.strftime('%Y-%m-%d') if d else ''
+
+
+def _status_text(val):
+    s = str(val if val is not None else '').strip()
+    return '' if s.lower() in ('nan', 'none', 'nat') else s
+
+
+def _prefix_seat_name(prefix):
+    return {
+        'Program Assistant': approver('program_assistant', 'name'),
+        'Lead TA': approver('lead_ta', 'name'),
+        'Director': approver('director', 'name'),
+    }.get(prefix, prefix)
+
+
+def _rejection_details(row, prefixes):
+    """(rejected_by, reason, date) for the first rejecting column, else ('', '', '')."""
+    for prefix in prefixes:
+        if _travel_approval_is_reject(row.get(f'{prefix} Approval Status')):
+            note = _status_text(row.get(f'{prefix} Note'))
+            m = _REJECTER_TAG.match(note)
+            if m:
+                who, note = m.group(1).strip(), note[m.end():].strip()
+            elif prefix == 'Program Assistant':
+                # Untagged PA rejections predate name tagging; before the current PA's start
+                # date the PA line was held by the alternate (Lauren).
+                d = _travel_sheet_date_to_date(row.get(f'{prefix} Approval Date'))
+                if d is not None and d < PA_SEAT_START:
+                    who = approver('alternate_pa', 'name')
+                else:
+                    who = f"{approver('program_assistant', 'name')} / {approver('alternate_pa', 'name')}"
+            else:
+                who = _prefix_seat_name(prefix)
+            return who, note, _status_date(row.get(f'{prefix} Approval Date'))
+    return '', '', ''
+
+
+def _who_can_sign_line(row, ln):
+    """Plain-language name(s) of whoever can sign this travel line right now."""
+    primary, backup = ln['primary'], ln.get('backup')
+    if backup and seat_is_out(primary):
+        return f"{approver(backup, 'name')} (covering for {approver(primary, 'name')})"
+    if backup and travel_seat_can_act_on_line(row, ln, backup):
+        return f"{approver(primary, 'name')} or {approver(backup, 'name')}"
+    return approver(primary, 'name')
+
+
+def travel_status_summary(row):
+    """Overall status + one plain-language cell per signature line for a Travel row."""
+    line_label = {'pa': 'Program Assistant', 'lead': 'Lead TA', 'director': 'Director'}
+    rej_by, rej_reason, rej_date = _rejection_details(
+        row, ('Program Assistant', 'Lead TA', 'Director', 'Mabintou')
+    )
+    if not travel_row_is_new_logic(row):
+        # Pre-handover form: show whatever signatures it carries.
+        signed = [
+            f"✅ {_status_text(row.get(f'{p} Signature')) or _prefix_seat_name(p)}"
+            f" ({_status_date(row.get(f'{p} Approval Date'))})"
+            for p in ('Program Assistant', 'Lead TA', 'Director')
+            if _travel_approval_status_norm(row.get(f'{p} Approval Status')) == 'approve'
+        ]
+        cells = (signed + ['', ''])[:2]
+        if rej_by:
+            status = '❌ Rejected'
+        elif travel_legacy_fully_approved(row):
+            status = '✅ Approved'
+        else:
+            status = '— Older form (before Aug 2026)'
+        return {'status': status, 'cells': cells, 'rejected_by': rej_by,
+                'reason': rej_reason, 'decision_date': rej_date}
+
+    cells, waiting = [], []
+    for ln in travel_row_lines(row):
+        label = line_label[ln['key']]
+        prefix = travel_line_signed_prefix(row, ln)
+        if prefix:
+            name = _status_text(row.get(f'{prefix} Signature')) or _prefix_seat_name(prefix)
+            cells.append(f"{label}: ✅ {name} ({_status_date(row.get(f'{prefix} Approval Date'))})")
+        elif any(_travel_approval_is_reject(row.get(f'{p} Approval Status')) for p in ln['prefixes']):
+            cells.append(f"{label}: ❌ rejected")
+        elif rej_by:
+            cells.append(f"{label}: — (closed)")
+        else:
+            who = _who_can_sign_line(row, ln)
+            waiting.append(who)
+            cells.append(f"{label}: ⏳ waiting on {who}")
+    if rej_by:
+        status = '❌ Rejected'
+    elif not waiting:
+        status = '✅ Approved'
+    elif len(waiting) < len(cells):
+        status = f"⏳ 1 of 2 signed — waiting on {waiting[0]}"
+    else:
+        status = '⏳ Submitted — waiting on both signatures'
+    return {'status': status, 'cells': (cells + ['', ''])[:2], 'rejected_by': rej_by,
+            'reason': rej_reason, 'decision_date': rej_date}
+
+
+def gsa_status_summary(row):
+    """Same idea for a GSA_exemption row: Director (Jen) + Lead TA (Kemisha)."""
+    rej_by, rej_reason, rej_date = _rejection_details(row, ('Director', 'Lead TA'))
+    cells, waiting = [], []
+    for prefix, role in (('Director', 'Program Director'), ('Lead TA', 'TA Lead')):
+        st_v = _travel_approval_status_norm(row.get(f'{prefix} Approval Status'))
+        if st_v == 'approve':
+            name = _status_text(row.get(f'{prefix} Signature')) or _prefix_seat_name(prefix)
+            cells.append(f"{role}: ✅ {name} ({_status_date(row.get(f'{prefix} Approval Date'))})")
+        elif _travel_approval_is_reject(st_v):
+            cells.append(f"{role}: ❌ rejected")
+        elif rej_by:
+            cells.append(f"{role}: — (closed)")
+        else:
+            waiting.append(_prefix_seat_name(prefix))
+            cells.append(f"{role}: ⏳ waiting on {_prefix_seat_name(prefix)}")
+    if rej_by:
+        status = '❌ Rejected'
+    elif not waiting:
+        status = '✅ Approved'
+    elif len(waiting) == 1:
+        status = f"⏳ 1 of 2 signed — waiting on {waiting[0]}"
+    else:
+        status = '⏳ Submitted — waiting on both signatures'
+    return {'status': status, 'cells': cells, 'rejected_by': rej_by,
+            'reason': rej_reason, 'decision_date': rej_date}
+
+
+def _latest_first(df_out):
+    """Newest submission first; rows submitted the same day keep sheet order, newest first."""
+    if df_out.empty:
+        return df_out
+    df_out = df_out.copy()
+    df_out['_sub'] = pd.to_datetime(df_out['Submitted'], errors='coerce')
+    df_out['_pos'] = range(len(df_out))
+    df_out = df_out.sort_values(['_sub', '_pos'], ascending=[False, False], na_position='last')
+    return df_out.drop(columns=['_sub', '_pos']).reset_index(drop=True)
+
+
+def build_travel_status_table(df_t, for_submitter=False):
+    rows = []
+    if df_t is None or df_t.empty:
+        return pd.DataFrame()
+    for _, r in df_t.iterrows():
+        s = travel_status_summary(r)
+        pdf = _status_text(r.get('PDF Link'))
+        rec = {
+            'Submitted': _status_date(r.get('Submission Date')),
+            'Traveler': _status_text(r.get('Name')),
+            'Destination': _status_text(r.get('Destination')),
+            'Departure': _status_date(r.get('Departure Date')) or _status_text(r.get('Departure Date')),
+            'Status': s['status'],
+            'First signature': s['cells'][0],
+            'Second signature': s['cells'][1],
+            'Rejected by': s['rejected_by'],
+            'Rejection reason': s['reason'],
+        }
+        if for_submitter:
+            rec['Final signed form'] = pdf if s['status'].startswith('✅') else ''
+            rec['Current PDF'] = pdf
+        else:
+            rec['PDF Link'] = pdf
+        rows.append(rec)
+    return _latest_first(pd.DataFrame(rows))
+
+
+def build_gsa_status_table(df_g, for_submitter=False):
+    rows = []
+    if df_g is None or df_g.empty:
+        return pd.DataFrame()
+    for _, r in df_g.iterrows():
+        s = gsa_status_summary(r)
+        pdf = _status_text(r.get('PDF Link'))
+        rec = {
+            'Submitted': _status_date(r.get('Submission Date')),
+            'Requester': _status_text(r.get('Requester Name') or r.get('Requestor Name')),
+            'Traveler(s)': _status_text(r.get('Traveler Name(s)')),
+            'City/State': _status_text(r.get('Travel City/State')),
+            'Dates of travel': _status_text(r.get('Dates of Travel')),
+            'Status': s['status'],
+            'Program Director': s['cells'][0],
+            'TA Lead': s['cells'][1],
+            'Rejected by': s['rejected_by'],
+            'Rejection reason': s['reason'],
+        }
+        if for_submitter:
+            rec['Final signed form'] = pdf if s['status'].startswith('✅') else ''
+            rec['Current PDF'] = pdf
+        else:
+            rec['PDF Link'] = pdf
+        rows.append(rec)
+    return _latest_first(pd.DataFrame(rows))
+
+
+def render_status_table(table, key, empty_msg):
+    """Counts + a status filter + the table (already newest first)."""
+    if table is None or table.empty:
+        st.info(empty_msg)
+        return
+    status = table['Status'].astype(str)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("⏳ Waiting", int(status.str.startswith('⏳').sum()))
+    c2.metric("❌ Rejected", int(status.str.startswith('❌').sum()))
+    c3.metric("✅ Approved", int(status.str.startswith('✅').sum()))
+    pick = st.radio("Show", STATUS_FILTER_OPTIONS, horizontal=True, key=f"{key}_filter")
+    view = table
+    if pick != "All":
+        view = table[status.str.startswith(pick.split()[0])]
+    if view.empty:
+        st.info("Nothing in this group.")
+    else:
+        show_df(view.reset_index(drop=True))
+
+
+def _rows_for_submitter(df_src, email, name, name_cols):
+    """Rows whose Email matches the login, or whose name column matches the staff name."""
+    if df_src is None or df_src.empty:
+        return df_src
+    e = str(email or '').strip().lower()
+    n = str(name or '').strip().lower()
+    mask = pd.Series(False, index=df_src.index)
+    if e and 'Email' in df_src.columns:
+        mask |= df_src['Email'].astype(str).str.strip().str.lower() == e
+    if n:
+        for c in name_cols:
+            if c in df_src.columns:
+                mask |= df_src[c].astype(str).str.strip().str.lower() == n
+    return df_src[mask]
+
+
 # --- Targeted Due Date reminders for TA providers ---------------------------------------
 TA_DUE_REMINDER_COL = 'Due Reminder Sent'   # stores which stages already fired, e.g. "due7|overdue30"
 TA_DUE_SOON_DAYS = 7                        # warn when the due date is this close
@@ -4834,113 +5077,18 @@ else:
                 
                 # Hide all expanders for Lauren except Travel Authorization Review Center
                 if not is_lauren_coordinator:
-                    with st.expander("🔎 **MONITOR IN-PROGRESS REQUESTS**"):
-                        st.markdown("""
-                        <div class="gutap-hero">
-                            <div class="gutap-hero-title">
-                                🔎 In-Progress Requests Monitor
-                            </div>
-                            <div class="gutap-hero-sub">
-                                Track all active Technical Assistance requests, view staff assignments, and monitor upcoming deadlines. Use interactive charts and filters to stay on top of your team's workload.
-                            </div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                        # Convert date columns
-                        df["Assigned Date"] = pd.to_datetime(df["Assigned Date"], errors="coerce")
-                        df["Targeted Due Date"] = pd.to_datetime(df["Targeted Due Date"], errors="coerce")
-                        df["Submit Date"] = pd.to_datetime(df["Submit Date"], errors="coerce")
+                    # (The 'Monitor in-progress requests' panel was removed — nobody used it.)
+                    # Date columns are still parsed here because the sections below rely on them.
+                    df["Assigned Date"] = pd.to_datetime(df["Assigned Date"], errors="coerce")
+                    df["Targeted Due Date"] = pd.to_datetime(df["Targeted Due Date"], errors="coerce")
+                    df["Submit Date"] = pd.to_datetime(df["Submit Date"], errors="coerce")
 
-                        inprogress = df[df['Status'] == 'In Progress']
-                        next_month = today + timedelta(days=30)
-                        request_pastmonth = df[(df["Targeted Due Date"] <= next_month)&(df['Status'] == 'In Progress')]
+                    staff_list = [approver('director', 'name'), approver('lead_ta', 'name'), "Katherine Robsky", "Jiaqin Wu", 
+                    "Kiah Moorehead","Vanessa Da Costa","Abby Jordan","Megan Highland","Jesus Hernandez Burgos",
+                    "Samantha Cinnick","Tara Hixson","Dzifa Awunyo-Akaba","Masill Miranda","Joy Berry","Ashley Clonchmore",
+                    "Grace Hazlett","Lauren Wagner"]
 
-                        col4, col5 = st.columns(2)
-                        # --- Pie 1: In Progress
-                        with col4:
-                            st.markdown("##### 🟡 In Progress Requests by Coach")
-                            if not inprogress.empty:
-                                chart_data = inprogress['Assigned Coach'].value_counts().reset_index()
-                                chart_data.columns = ['Assigned Coach', 'Count']
-                                pie1 = alt.Chart(chart_data).mark_arc(innerRadius=50).encode(
-                                    theta=alt.Theta(field="Count", type="quantitative"),
-                                    color=alt.Color(field="Assigned Coach", type="nominal"),
-                                    tooltip=["Assigned Coach", "Count"]
-                                ).properties(width=250, height=250)
-                                st.altair_chart(pie1, use_container_width=True)
-                            else:
-                                st.info("No in-progress requests to show.")
-
-                        # --- Pie 2: Requests in Past Month
-                        with col5:
-                            st.markdown("##### 📅 Due in 30 Days by Coach")
-                            if not request_pastmonth.empty:
-                                chart_data = request_pastmonth['Assigned Coach'].value_counts().reset_index()
-                                chart_data.columns = ['Assigned Coach', 'Count']
-                                pie2 = alt.Chart(chart_data).mark_arc(innerRadius=50).encode(
-                                    theta=alt.Theta(field="Count", type="quantitative"),
-                                    color=alt.Color(field="Assigned Coach", type="nominal"),
-                                    tooltip=["Assigned Coach", "Count"]
-                                ).properties(width=250, height=250)
-                                st.altair_chart(pie2, use_container_width=True)
-                            else:
-                                st.info("No requests with coming dues to show.")
-
-
-                        staff_list = [approver('director', 'name'), approver('lead_ta', 'name'), "Katherine Robsky", "Jiaqin Wu", 
-                        "Kiah Moorehead","Vanessa Da Costa","Abby Jordan","Megan Highland","Jesus Hernandez Burgos",
-                        "Samantha Cinnick","Tara Hixson","Dzifa Awunyo-Akaba","Masill Miranda","Joy Berry","Ashley Clonchmore",
-                        "Grace Hazlett","Lauren Wagner"]
-
-                        staff_list_sorted = sorted(staff_list, key=lambda x: x.split()[0])
-
-                        selected_staff = st.selectbox("Select a staff to view their requests", staff_list_sorted, index=None,
-                                placeholder="Select option...")
-
-                        today = datetime.today()
-                        last_month = today - timedelta(days=30)
-                        staff_dff = df[df["Assigned Coach"] == selected_staff].copy()
-                        in_progress_count = staff_dff[staff_dff["Status"] == "In Progress"]['Ticket ID'].nunique()
-                        due_soon_count = staff_dff[
-                            (staff_dff["Status"] == "In Progress") & 
-                            (staff_dff["Targeted Due Date"] <= next_month)
-                        ]['Ticket ID'].nunique()
-                        completed_recently = staff_dff[
-                            (staff_dff["Status"] == "Completed") & 
-                            (staff_dff["Submit Date"] >= last_month)
-                        ]['Ticket ID'].nunique()
-
-                        # Metric 
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("🟡 In Progress", in_progress_count)
-                        col2.metric("📅 Due in 30 Days", due_soon_count)
-                        col3.metric("✅ Completed (Last 30 Days)", completed_recently)
-
-                        # Detailed Table
-                        st.markdown("##### 📋 Detailed Request List")
-
-                        # Status filter
-                        status_options = ["In Progress", "Completed"]
-                        selected_status = st.multiselect(
-                            "Filter by request status",
-                            options=status_options,
-                            default=["In Progress"]
-                        )
-
-                        # Apply filters: staff and status
-                        staff_dfff = staff_dff[staff_dff["Status"].isin(selected_status)].copy()
-
-                        display_cols = [
-                            "Ticket ID", "Jurisdiction", "Organization", "Name", "Focus Area", "TA Type",
-                            "Targeted Due Date", "Priority", "Status", "TA Description","Document"
-                        ]
-
-                        # Sort by due date
-                        staff_dfff = staff_dfff.sort_values(by="Targeted Due Date")
-
-                        # Format dates for display
-                        staff_dfff["Targeted Due Date"] = staff_dfff["Targeted Due Date"].dt.strftime("%Y-%m-%d")
-
-                        show_df(staff_dfff[display_cols].reset_index(drop=True))
+                    staff_list_sorted = sorted(staff_list, key=lambda x: x.split()[0])
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
                     with st.expander("📝 **ASSIGN TA REQUESTS**"):
@@ -5273,184 +5421,101 @@ else:
                         st.markdown("""
                             <div class="gutap-hero">
                                 <div class="gutap-hero-title">
-                                    👍 Request Management Center
+                                    💬 Request comments
                                 </div>
                                 <div class="gutap-hero-sub">
-                                    Leave comments and updates for in-progress TA requests, and review the status and details of completed requests. Track progress and maintain clear communication.
+                                    Pick an in-progress request, read its comment history, and leave a comment for the team.
                                 </div>
                             </div>
                         """, unsafe_allow_html=True)
 
-                        st.markdown("#### 🚧 In-progress Requests")
-
-
-                        # Filter "In Progress" requests
                         in_progress_df = df[df["Status"] == "In Progress"].copy()
 
                         if in_progress_df.empty:
                             st.info("No requests currently in progress.")
                         else:
-                            # Convert date columns
-                            in_progress_df["Assigned Date"] = pd.to_datetime(in_progress_df["Assigned Date"], errors="coerce")
-                            in_progress_df["Targeted Due Date"] = pd.to_datetime(in_progress_df["Targeted Due Date"], errors="coerce")
-                            in_progress_df['Expected Duration (Days)'] = (in_progress_df["Targeted Due Date"]-in_progress_df["Assigned Date"]).dt.days
+                            in_progress_df["_due"] = pd.to_datetime(in_progress_df["Targeted Due Date"], errors="coerce")
+                            in_progress_df = in_progress_df.sort_values("_due", na_position="last")
+                            overview = pd.DataFrame({
+                                "Ticket ID": in_progress_df["Ticket ID"],
+                                "Jurisdiction": in_progress_df["Jurisdiction"],
+                                "Requester": in_progress_df["Name"],
+                                "Assigned Coach": in_progress_df["Assigned Coach"],
+                                "Due": in_progress_df["_due"].dt.strftime("%Y-%m-%d"),
+                                "Latest comment": in_progress_df["Coordinator Comment"],
+                            })
+                            st.caption(f"{len(in_progress_df)} in-progress request(s), soonest due first.")
+                            show_df(overview.fillna("").reset_index(drop=True))
 
-                            # Format dates
-                            in_progress_df["Assigned Date"] = in_progress_df["Assigned Date"].dt.strftime("%Y-%m-%d")
-                            in_progress_df["Targeted Due Date"] = in_progress_df["Targeted Due Date"].dt.strftime("%Y-%m-%d")
-
-
-                            # --- Filters
-                            st.markdown("##### 🔍 Filter Options")
-
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                priority_filter = st.multiselect(
-                                    "Filter by Priority",
-                                    options=in_progress_df["Priority"].unique(),
-                                    default=in_progress_df["Priority"].unique(), key='in1'
-                                )
-
-                            with col2:
-                                ta_type_filter = st.multiselect(
-                                    "Filter by TA Type",
-                                    options=in_progress_df["TA Type"].unique(),
-                                    default=in_progress_df["TA Type"].unique(), key='in2'
-                                )
-
-                            with col3:
-                                focus_area_filter = st.multiselect(
-                                    "Filter by Focus Area",
-                                    options=in_progress_df["Focus Area"].unique(),
-                                    default=in_progress_df["Focus Area"].unique(), key='in3'
-                                )
-
-
-                            # Apply filters
-                            filtered_df = in_progress_df[
-                                (in_progress_df["Priority"].isin(priority_filter)) &
-                                (in_progress_df["TA Type"].isin(ta_type_filter)) &
-                                (in_progress_df["Focus Area"].isin(focus_area_filter))
-                            ]
-
-                            # Display filtered table
-                            show_df(filtered_df[[
-                                "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
-                                "Focus Area", "TA Type", "Assigned Date", "Targeted Due Date","Expected Duration (Days)","Priority",
-                                "Assigned Coach", "TA Description","Document","Coordinator Comment History"
-                            ]].sort_values(by="Expected Duration (Days)").reset_index(drop=True))
-
-                            # Select request by index (row number in submitted_requests)
-                            request_indices1 = filtered_df.index.tolist()
                             selected_request_index1 = st.selectbox(
-                                "Select a request to comment",
-                                options=request_indices1,
-                                format_func=lambda idx: f"{filtered_df.at[idx, 'Ticket ID']} | {filtered_df.at[idx, 'Name']} | {filtered_df.at[idx, 'Jurisdiction']}",
+                                "Select a request to comment on",
+                                options=in_progress_df.index.tolist(),
+                                format_func=lambda idx: (
+                                    f"{in_progress_df.at[idx, 'Ticket ID']} | {in_progress_df.at[idx, 'Name']} | "
+                                    f"{in_progress_df.at[idx, 'Jurisdiction']}"
+                                ),
+                                key="coord_comment_pick",
                             )
 
-                            # Input + submit comment
-                            comment_input = st.text_area("Comments", placeholder="Enter comments", height=150, key='comm')
+                            _hist = str(in_progress_df.at[selected_request_index1, "Coordinator Comment History"] or "").strip()
+                            _staff_hist = str(in_progress_df.at[selected_request_index1, "Staff Comment History"] or "").strip()
+                            if _hist and _hist.lower() != "nan":
+                                st.markdown("**Coordinator comments so far**")
+                                st.text(_hist)
+                            if _staff_hist and _staff_hist.lower() != "nan":
+                                st.markdown("**Staff comments so far**")
+                                st.text(_staff_hist)
 
-                            if st.button("✅ Submit Comments"):
-                                try:
-                                    # Find the actual row index in the original df (map back using ID or index)
-                                    selected_row_global_index = filtered_df.loc[selected_request_index1].name
+                            comment_input = st.text_area("Your comment", placeholder="Enter comments", height=120, key='comm')
 
-                                    # Copy and update df
-                                    updated_df = df.copy()
-                                    # Keep latest comment in main field
-                                    updated_df.loc[selected_row_global_index, "Coordinator Comment"] = comment_input
-                                    # Append to history with timestamp and author
-                                    ts = datetime.today().strftime("%Y-%m-%d %H:%M")
-                                    author = coordinator_name
-                                    entry = f"{ts} | {author}: {comment_input}" if comment_input else ""
-                                    if entry:
-                                        existing = str(updated_df.loc[selected_row_global_index, "Coordinator Comment History"]).strip()
+                            if st.button("✅ Submit Comment", key="coord_comment_submit"):
+                                if not (comment_input or "").strip():
+                                    st.warning("Please type a comment first.")
+                                else:
+                                    try:
+                                        updated_df = df.copy()
+                                        # Keep latest comment in main field
+                                        updated_df.loc[selected_request_index1, "Coordinator Comment"] = comment_input
+                                        # Append to history with timestamp and author
+                                        ts = datetime.today().strftime("%Y-%m-%d %H:%M")
+                                        entry = f"{ts} | {coordinator_name}: {comment_input}"
+                                        existing = str(updated_df.loc[selected_request_index1, "Coordinator Comment History"]).strip()
                                         if existing and existing.lower() != "nan":
-                                            updated_df.loc[selected_row_global_index, "Coordinator Comment History"] = existing + "\n" + entry
+                                            updated_df.loc[selected_request_index1, "Coordinator Comment History"] = existing + "\n" + entry
                                         else:
-                                            updated_df.loc[selected_row_global_index, "Coordinator Comment History"] = entry
-                                    updated_df = updated_df.applymap(
-                                        lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (pd.Timestamp, datetime)) and not pd.isna(x) else x
-                                    )
-                                    updated_df = updated_df.fillna("") 
+                                            updated_df.loc[selected_request_index1, "Coordinator Comment History"] = entry
+                                        updated_df = updated_df.applymap(
+                                            lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (pd.Timestamp, datetime)) and not pd.isna(x) else x
+                                        )
+                                        updated_df = updated_df.fillna("")
 
+                                        spreadsheet1 = get_spreadsheet()
+                                        worksheet1 = spreadsheet1.worksheet('Main')
+                                        worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
+                                        load_main_sheet.clear()  # only the sheet just written, not every cached loader
 
-                                    # Push to Google Sheets
-                                    spreadsheet1 = get_spreadsheet()
-                                    worksheet1 = spreadsheet1.worksheet('Main')
-                                    worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
+                                        st.success("💬 Comment saved.")
+                                        time.sleep(2)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error updating Google Sheets: {str(e)}")
 
-                                    # Clear cache to refresh data
-                                    load_main_sheet.clear()  # only the sheet just written, not every cached loader
-                                    
-                                    st.success("💬 Comment saved successfully!.")
-                                    time.sleep(2)
-                                    st.rerun()
-
-                                except Exception as e:
-                                    st.error(f"Error updating Google Sheets: {str(e)}")
-
-                        st.markdown("#### ✅ Completed Requests")
-
-
-                        # Filter "Completed" requests
-                        complete_df = df[df["Status"] == "Completed"].copy()
-
-                        if complete_df.empty:
-                            st.info("No requests currently completed.")
-                        else:
-                            # Convert date columns
-                            complete_df["Assigned Date"] = pd.to_datetime(complete_df["Assigned Date"], errors="coerce")
-                            complete_df["Close Date"] = pd.to_datetime(complete_df["Close Date"], errors="coerce")
-                            complete_df["Targeted Due Date"] = pd.to_datetime(complete_df["Targeted Due Date"], errors="coerce")
-                            complete_df['Expected Duration (Days)'] = (complete_df["Targeted Due Date"]-complete_df["Assigned Date"]).dt.days
-                            complete_df['Actual Duration (Days)'] = (complete_df["Close Date"]-complete_df["Assigned Date"]).dt.days
-
-                            # Format dates
-                            complete_df["Assigned Date"] = complete_df["Assigned Date"].dt.strftime("%Y-%m-%d")
-                            complete_df["Targeted Due Date"] = complete_df["Targeted Due Date"].dt.strftime("%Y-%m-%d")
-                            complete_df["Close Date"] = complete_df["Close Date"].dt.strftime("%Y-%m-%d")
-
-                            # --- Filters
-                            st.markdown("##### 🔍 Filter Options")
-
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                priority_filter1 = st.multiselect(
-                                    "Filter by Priority",
-                                    options=complete_df["Priority"].unique(),
-                                    default=complete_df["Priority"].unique(), key='com1'
-                                )
-
-                            with col2:
-                                ta_type_filter1 = st.multiselect(
-                                    "Filter by TA Type",
-                                    options=complete_df["TA Type"].unique(),
-                                    default=complete_df["TA Type"].unique(), key='com2'
-                                )
-
-                            with col3:
-                                focus_area_filter1 = st.multiselect(
-                                    "Filter by Focus Area",
-                                    options=complete_df["Focus Area"].unique(),
-                                    default=complete_df["Focus Area"].unique(), key='com3'
-                                )
-
-                            # Apply filters
-                            filtered_df1 = complete_df[
-                                (complete_df["Priority"].isin(priority_filter1)) &
-                                (complete_df["TA Type"].isin(ta_type_filter1)) &
-                                (complete_df["Focus Area"].isin(focus_area_filter1))
-                            ]
-
-                            # Display filtered table
-                            show_df(filtered_df1[[
-                                "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
-                                "Focus Area", "TA Type", "Priority", "Assigned Coach", "TA Description","Document","Assigned Date",
-                                "Targeted Due Date", "Close Date", "Expected Duration (Days)",
-                                'Actual Duration (Days)', "Coordinator Comment History", "Staff Comment History", "Transfer History"
-                            ]].reset_index(drop=True))
+                        if st.checkbox("Show completed requests", key="coord_show_completed"):
+                            complete_df = df[df["Status"] == "Completed"].copy()
+                            if complete_df.empty:
+                                st.info("No requests currently completed.")
+                            else:
+                                complete_df["_closed"] = pd.to_datetime(complete_df["Close Date"], errors="coerce")
+                                complete_df = complete_df.sort_values("_closed", ascending=False, na_position="last")
+                                show_df(pd.DataFrame({
+                                    "Ticket ID": complete_df["Ticket ID"],
+                                    "Jurisdiction": complete_df["Jurisdiction"],
+                                    "Requester": complete_df["Name"],
+                                    "Assigned Coach": complete_df["Assigned Coach"],
+                                    "Closed": complete_df["_closed"].dt.strftime("%Y-%m-%d"),
+                                    "Document": complete_df["Document"],
+                                    "Coordinator Comment History": complete_df["Coordinator Comment History"],
+                                }).fillna("").reset_index(drop=True))
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
                     with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
@@ -5919,8 +5984,9 @@ else:
 
                         # Load travel sheet data
                         try:
+                            # Reminder emails run once per login in run_reminder_sweeps(); doing it again
+                            # here re-tried failed sends on every click.
                             df_travel_review = load_travel_sheet()
-                            df_travel_review = process_travel_review_escalations(df_travel_review, client)
 
                             render_out_of_office_panel(my_seat, is_jiaqin, df_travel_review)
 
@@ -5990,7 +6056,11 @@ else:
                                 ].copy()
 
                             if pending_forms.empty:
-                                st.info("✅ No travel forms pending your approval at this time.")
+                                st.info(
+                                    "✅ No travel forms pending your approval at this time. "
+                                    "Looking for a specific form? Check **All travel forms — status** below: "
+                                    "it may already be signed by a backup, or rejected by the other approver."
+                                )
                             else:
                                 st.markdown(f"#### Forms pending your action ({coordinator_display_name}) · {len(pending_forms)} in queue")
                                 
@@ -6308,7 +6378,8 @@ GU-TAP System
                                                     updated_df_travel = df_travel_review.copy()
                                                     updated_df_travel.loc[selected_form_idx, status_col] = 'reject'
                                                     updated_df_travel.loc[selected_form_idx, approval_date_col] = approval_date.strftime('%Y-%m-%d')
-                                                    updated_df_travel.loc[selected_form_idx, note_col] = reject_note
+                                                    # Name tag records who rejected (the PA columns are shared by Alexis and Lauren).
+                                                    updated_df_travel.loc[selected_form_idx, note_col] = f"[{coordinator_display_name}] {reject_note.strip()}"
                                                     
                                                     # This rejection closes the form. Any other line still waiting is cleared so the form
                                                     # leaves the other approvers' queues; approvals already given are kept as a record.
@@ -6373,6 +6444,19 @@ GU-TAP System
                                                 except Exception as e:
                                                     st.error(f"❌ Error rejecting travel form: {str(e)}")
                             
+                            # Every travel form and where it stands (rejected ones included), newest first.
+                            st.markdown("---")
+                            st.markdown("#### 📋 All travel forms — status (newest first)")
+                            st.caption(
+                                "A form rejected by one approver is closed and leaves everyone's queue. "
+                                "It stays here with who rejected it and why, so nothing just 'disappears'."
+                            )
+                            render_status_table(
+                                build_travel_status_table(df_travel_review),
+                                key="coord_travel_status",
+                                empty_msg="No travel forms submitted yet.",
+                            )
+
                             # Show approved forms section
                             st.markdown("---")
                             st.markdown("#### ✅ Fully Approved Forms")
@@ -6516,23 +6600,8 @@ GU-TAP System
                                     st.info(
                                         f"GSA exemption forms are signed only by **{approver('director', 'name')}** "
                                         f"and **{approver('lead_ta', 'name')}**. "
-                                        "Below is a read-only view of all submitted forms."
+                                        "See **All GSA exemption forms — status** below for every form."
                                     )
-                                    display_cols = [
-                                        c for c in df_gsa_review.columns
-                                        if c in [
-                                            'Requester Name', 'Traveler Name(s)', 'Travel City/State',
-                                            'Dates of Travel', 'Director Approval Status', 'Lead TA Approval Status',
-                                            'PDF Link', 'Email', 'Submission Date',
-                                        ]
-                                    ]
-                                    if display_cols:
-                                        show_df(
-                                            df_gsa_review[display_cols].reset_index(drop=True),
-                                            use_container_width=True,
-                                        )
-                                    else:
-                                        show_df(df_gsa_review.reset_index(drop=True), use_container_width=True)
                                     folder_id_gsa_pdf_regen = "1_O_L-jPR7bldiryRNB3WxbAaG8VqvmCt"
                                     st.markdown("##### Regenerate GSA PDF from sheet")
                                     st.caption(
@@ -6634,7 +6703,11 @@ GU-TAP System
 
                                     st.markdown(f"#### 📋 GSA Forms Pending Your Approval ({coordinator_display_name_gsa})")
                                     if pending_gsa.empty:
-                                        st.info("No GSA exemption forms pending your approval.")
+                                        st.info(
+                                            "No GSA exemption forms pending your approval. "
+                                            "See **All GSA exemption forms — status** below for everything else, "
+                                            "including forms the other approver rejected."
+                                        )
                                         folder_id_gsa_pdf_regen = "1_O_L-jPR7bldiryRNB3WxbAaG8VqvmCt"
                                         st.markdown("##### Regenerate GSA PDF from sheet")
                                         st.caption(
@@ -6996,14 +7069,16 @@ GU-TAP System
                                                         else:
                                                             other_status_col = None
 
-                                                        if other_status_col and other_status_col in updated_gsa.columns:
+                                                        # Close the other approver's line only if it was still waiting;
+                                                        # an approval already given stays on record for the status table.
+                                                        if (
+                                                            other_status_col
+                                                            and other_status_col in updated_gsa.columns
+                                                            and _travel_approval_status_norm(
+                                                                updated_gsa.loc[selected_gsa_idx, other_status_col]
+                                                            ) == 'pending'
+                                                        ):
                                                             updated_gsa.loc[selected_gsa_idx, other_status_col] = ''
-                                                            other_date_col = other_status_col.replace('Approval Status', 'Approval Date')
-                                                            other_sig_col = other_status_col.replace('Approval Status', 'Signature')
-                                                            if other_date_col in updated_gsa.columns:
-                                                                updated_gsa.loc[selected_gsa_idx, other_date_col] = ''
-                                                            if other_sig_col in updated_gsa.columns:
-                                                                updated_gsa.loc[selected_gsa_idx, other_sig_col] = ''
 
                                                         updated_gsa = updated_gsa.fillna("")
                                                         updated_gsa = reorder_gsa_exemption_dataframe(updated_gsa)
@@ -7047,6 +7122,21 @@ GU-TAP System
                                                         st.error(f"Error: {str(e)}")
                         except Exception as e:
                             st.error(f"Error loading GSA exemption forms: {str(e)}")
+                        # --- Every GSA exemption and where it stands, newest first ---
+                        st.markdown("---")
+                        st.markdown("#### 📋 All GSA exemption forms — status (newest first)")
+                        st.caption(
+                            "A form rejected by one approver is closed for both. "
+                            "It stays here with who rejected it and why."
+                        )
+                        try:
+                            render_status_table(
+                                build_gsa_status_table(load_gsa_exemption_sheet()),
+                                key="coord_gsa_status",
+                                empty_msg="No GSA exemption forms submitted yet.",
+                            )
+                        except Exception as e:
+                            st.error(f"Error loading GSA exemption status: {str(e)}")
                         # --- Approved GSA exemptions: full archive for tracking back ---
                         st.markdown("---")
                         st.markdown("#### ✅ Approved GSA Exemption Forms")
@@ -7093,99 +7183,6 @@ GU-TAP System
                                     )
                         except Exception as e:
                             st.error(f"Error loading approved GSA exemption forms: {str(e)}")
-
-                st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-
-                with st.expander("📦 **CHECK INTERACTION & DELIVERY PATTERNS**"):
-                    st.markdown("""
-                        <div class="gutap-hero">
-                            <div class="gutap-hero-title">
-                                📦 Activity Analytics Center
-                            </div>
-                            <div class="gutap-hero-sub">
-                                Visualize and analyze communication and delivery patterns for all Technical Assistance requests. Use charts and filters to spot trends and monitor engagement.
-                            </div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                    # Fetch data from Google Sheets     
-                    try:
-                        df = load_main_sheet()  # Use cached function
-                    except Exception as e:
-                        st.error(f"Error fetching data from Google Sheets: {str(e)}")
-
-                    try:
-                        df_int = load_interaction_sheet()  # Use cached function
-                    except Exception as e:
-                        st.error(f"Error fetching data from Google Sheets: {str(e)}")
-
-                    try:
-                        df_del = load_delivery_sheet()  # Use cached function
-                    except Exception as e:
-                        st.error(f"Error fetching data from Google Sheets: {str(e)}")
-                        
-                    num_interaction = df_int.shape[0]
-                    num_delivery = df_del.shape[0]
-
-                    col1, col2 = st.columns(2)
-                    col1.metric("🟡 # of Interactions", num_interaction)
-                    col2.metric("🟡 # of Deliveries", num_delivery)
-
-                    # Group by Ticket ID and Type of Interaction, count occurrences
-                    interaction_counts = df_int.groupby(['Ticket ID', 'Type of Interaction']).size().reset_index(name='Count')
-                    delivery_counts = df_del.groupby(['Ticket ID', 'Type of Delivery']).size().reset_index(name='Count')
-
-
-                    st.markdown("##### 🟡 Top 10 with most Interactions by Interaction Type")
-                    if not interaction_counts.empty:
-                        pie1 = alt.Chart(interaction_counts).mark_bar().encode(
-                            y=alt.Y('Ticket ID:N', sort='-x', title='Ticket ID'),
-                            x=alt.X('Count:Q', title='Number of Interactions'),
-                            color=alt.Color('Type of Interaction:N', title='Interaction Type'),
-                            tooltip=['Ticket ID', 'Type of Interaction', 'Count']
-                        ).properties(
-                            width=600,
-                            height=400
-                        )
-                        st.altair_chart(pie1, use_container_width=True)
-                    else:
-                        st.info("No any interaction to show.")
-
-                    st.markdown("##### 🟡 Top 10 with most Deliveries by Delivery Type")
-                    if not delivery_counts.empty:
-                        pie1 = alt.Chart(delivery_counts).mark_bar().encode(
-                            y=alt.Y('Ticket ID:N', sort='-x', title='Ticket ID'),
-                            x=alt.X('Count:Q', title='Number of Deliveries'),
-                            color=alt.Color('Type of Delivery:N', title='Delivery Type'),
-                            tooltip=['Ticket ID', 'Type of Delivery', 'Count']
-                        ).properties(
-                            width=600,
-                            height=400
-                        )
-                        st.altair_chart(pie1, use_container_width=True)
-                    else:
-                        st.info("No any delivery to show.")
-
-
-                    unique_id = sorted(set(df_int["Ticket ID"].unique().tolist() + df_del["Ticket ID"].unique().tolist()))
-                    selected_ticket_id = st.selectbox("Select a Ticket ID", unique_id, placeholder="Select option...")
-                    # Filter records
-                    interactions_for_ticket = df_int[df_int["Ticket ID"] == selected_ticket_id]
-                    deliveries_for_ticket = df_del[df_del["Ticket ID"] == selected_ticket_id]
-                    num_interaction_ticket = interactions_for_ticket.shape[0]
-                    num_delivery_ticket = deliveries_for_ticket.shape[0]
-                    st.markdown(f"##### 🟡 Ticket ID: {selected_ticket_id}")
-                    st.markdown(f"🟡 # of Interactions: {num_interaction_ticket if num_interaction_ticket > 0 else 0}")
-                    if num_interaction_ticket > 0:
-                        show_df(interactions_for_ticket)
-                    else:
-                        st.info("No interaction records found for this Ticket ID.")
-                    st.markdown(f"🟡 # of Deliveries: {num_delivery_ticket if num_delivery_ticket > 0 else 0}")
-                    if num_delivery_ticket > 0:
-                        show_df(deliveries_for_ticket)
-                    else:
-                        st.info("No delivery records found for this Ticket ID.")
-                  
-
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
@@ -8113,6 +8110,42 @@ GU-TAP System
 
                             except Exception as e:
                                 st.error(f"Error updating Google Sheets: {str(e)}")
+
+                st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
+
+                with st.expander("📬 **MY TRAVEL & GSA FORMS — STATUS**"):
+                    st.markdown("""
+                        <div class="gutap-hero">
+                            <div class="gutap-hero-title">📬 Track your forms</div>
+                            <div class="gutap-hero-sub">See where each travel authorization and GSA exemption you submitted stands. Once both approvers sign, the final signed form appears in the <b>Final signed form</b> column (Google Drive).</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                    try:
+                        my_travel = _rows_for_submitter(load_travel_sheet(), user_email, staff_name, ['Name'])
+                        st.markdown("#### ✈️ My travel authorizations")
+                        render_status_table(
+                            build_travel_status_table(my_travel, for_submitter=True),
+                            key="my_travel_status",
+                            empty_msg="You haven't submitted a travel authorization yet.",
+                        )
+                    except Exception as e:
+                        st.error(f"Could not load your travel forms: {str(e)}")
+                    try:
+                        my_gsa = _rows_for_submitter(
+                            load_gsa_exemption_sheet(), user_email, staff_name, ['Requester Name']
+                        )
+                        st.markdown("#### 🧳 My GSA lodging exemptions")
+                        render_status_table(
+                            build_gsa_status_table(my_gsa, for_submitter=True),
+                            key="my_gsa_status",
+                            empty_msg="You haven't submitted a GSA lodging exemption yet.",
+                        )
+                    except Exception as e:
+                        st.error(f"Could not load your GSA forms: {str(e)}")
+                    st.caption(
+                        "⏳ Waiting = still with an approver · ❌ Rejected = see the reason, fix and resubmit · "
+                        "✅ Approved = open the Final signed form link. Click **Refresh data** in the sidebar to update."
+                    )
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
