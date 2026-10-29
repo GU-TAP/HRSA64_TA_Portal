@@ -484,23 +484,27 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json),
 client = gspread.authorize(creds)
 
 # --- Standardized interaction logging (legacy-safe, October 2026) ----------------------
-# Keep the existing "Type of Interaction" sheet column for older reports. New records
-# additionally write "Interaction Type" (communication channel) and "TA / Activity
-# Category" (purpose). Never infer a communication channel for old PLN/webinar records.
+# The old "Type of Interaction" sheet column is retained only for historical rows.
+# New records use "Interaction Type" and "TA / Activity Category", leaving the old
+# column blank. Never infer the communication channel of old PLN/webinar entries.
 INTERACTION_TYPES = [
-    "E-mail", "Phone Call", "Online Meeting (Virtual)", "In-Person Meeting",
-    "Document or Material Sharing", "Other",
+    "Ad-Hoc Peer Exchange", "E-mail", "Phone Call", "Online Meeting (Virtual)",
+    "In-Person Meeting", "Document or Material Sharing", "Other",
 ]
 TA_ACTIVITY_CATEGORIES = [
     "Peer Learning Network Meeting (PLN)", "1-on-1 TA", "Office Hours",
     "Webinar", "Intensive Technical Assistance Workshop", "Other",
 ]
-TA_FOCUS_AREA_OPTIONS = [
+# Shared by the requester form and the standalone Interaction logging forms.
+# Keep Other as the final option, irrespective of case-sensitive sorting.
+TA_FOCUS_AREA_OPTIONS = sorted([
     "Housing", "Prevention", "Substance Abuse", "Rapid Start",
     "Telehealth/Telemedicine", "Data Sharing", "Evaluation",
     "Implementation Science", "Continuous Quality Improvement", "Sustainability",
-    "Sub-recipient Monitoring", "Procurement", "Work Plan and Budget", "Other",
-]
+    "Sub-recipient Monitoring", "Procurement", "Work Plan and Budget",
+    "Long-acting Injectables (LAI)", "Jail Linkage", "Low-barrier Clinics",
+], key=str.casefold) + ["Other"]
+
 SHARED_ACTIVITY_CATEGORIES = {
     "Peer Learning Network Meeting (PLN)", "Office Hours", "Webinar",
     "Intensive Technical Assistance Workshop",
@@ -605,10 +609,21 @@ def render_interaction_classification(ticket_id, df_main, key_prefix):
     return selected_channel or "", selected_category or "", focus_area
 
 
-def _is_shared_activity(data):
+def _group_activity_label(data):
+    """Shared-activity label; Ad-Hoc Peer Exchange is selected in Interaction Type."""
     normalized = normalize_interaction_dataframe(data)
+    category = normalized["TA / Activity Category"].fillna("").astype(str).str.strip()
+    channel = normalized["Interaction Type"].fillna("").astype(str).str.strip()
+    ad_hoc = channel.str.casefold().eq("ad-hoc peer exchange")
+    return category.mask(ad_hoc, "Ad-Hoc Peer Exchange")
+
+
+def _is_shared_activity(data):
+    """Group events are visible to the team, including ad-hoc peer exchanges."""
+    labels = _group_activity_label(data)
     allowed = {category.casefold() for category in SHARED_ACTIVITY_CATEGORIES}
-    return normalized["TA / Activity Category"].fillna("").astype(str).str.strip().str.casefold().isin(allowed)
+    allowed.add("ad-hoc peer exchange")
+    return labels.str.casefold().isin(allowed)
 
 
 def interactions_visible_to(df_interactions, person_name):
@@ -640,25 +655,28 @@ def group_interactions(df_interactions):
 
 
 def _distinct_activity_count(df_rows):
-    """Count one group activity per event, not per jurisdiction.
+    """Count sessions rather than jurisdiction rows using shared event details.
 
-    An interaction is recorded once for each participating jurisdiction. The
-    shared date, ticket, category, meeting type, summary, and submitter serve
-    as a grouping signature, so the backend does not need a separate ID.
+    There is no Activity ID in the sheet. Group entries entered with the same
+    date, category, interaction type, and summary are one session, regardless of
+    jurisdiction, ticket or submitter. A missing date/summary is kept distinct
+    rather than silently merging events. Distinct identically described events
+    on the same day still cannot be disambiguated without a session identifier.
     """
     if df_rows is None or getattr(df_rows, "empty", True):
         return 0
     result = normalize_interaction_dataframe(df_rows)
-    signature_columns = (
-        "Date of Interaction", "Ticket ID", "TA / Activity Category",
-        "Type of Interaction", "Short Summary", "Submitted By",
-    )
+    labels = _group_activity_label(result)
     signatures = set()
-    for _, row in result.iterrows():
-        signatures.add(tuple(
-            _dedup_date(row.get(col)) if col == "Date of Interaction"
-            else _dedup_text(row.get(col))
-            for col in signature_columns
+    for pos, (_, row) in enumerate(result.iterrows()):
+        day = _dedup_date(row.get("Date of Interaction"))
+        summary = _dedup_text(row.get("Short Summary"))
+        if not day or not summary:
+            signatures.add(("record", pos))
+            continue
+        signatures.add((
+            day, _dedup_text(labels.iloc[pos]),
+            _dedup_text(row.get("Interaction Type")), summary,
         ))
     return len(signatures)
 
@@ -691,15 +709,16 @@ def render_group_activity_section(df_interactions, key_prefix):
         )
         m3.metric("Jurisdictions reached", int(jurisdictions))
 
+        view["Group Activity"] = _group_activity_label(view)
         available = sorted(
-            label for label in view["TA / Activity Category"].fillna("")
-            .astype(str).str.strip().unique() if label
+            (label for label in view["Group Activity"].unique() if label),
+            key=str.casefold,
         )
         selected = st.multiselect(
-            "TA / Activity Category", available, default=available,
+            "Group Activity", available, default=available,
             key=f"{key_prefix}_group_category_filter",
         )
-        view = view.loc[view["TA / Activity Category"].isin(selected)]
+        view = view.loc[view["Group Activity"].isin(selected)]
         display = view.drop(
             columns=["Submission Date", "Type of Interaction", "Activity ID"],
             errors="ignore",
@@ -3985,7 +4004,7 @@ if "Entered By" not in df_del.columns:
 # Two rows are the same entry when every key field below matches. The Delivery sheet has
 # no Jurisdiction column (report.py joins it from Main), so its key can't include one.
 INTERACTION_DEDUP_KEYS = [
-    "Ticket ID", "Jurisdiction", "Date of Interaction", "Type of Interaction",
+    "Ticket ID", "Jurisdiction", "Date of Interaction", "Interaction Type",
     "TA / Activity Category", "Short Summary", "Submitted By",
 ]
 DELIVERY_DEDUP_KEYS = [
@@ -5875,7 +5894,7 @@ else:
                                     {
                                         'Ticket ID': ticket_id_int,
                                         "Date of Interaction": date_int.strftime("%Y-%m-%d"),
-                                        "Type of Interaction": type_interaction,  # legacy report compatibility
+                                        "Type of Interaction": "",  # new records use the two new fields
                                         "Interaction Type": type_interaction,
                                         "TA / Activity Category": activity_category,
                                         "Focus Area": focus_area_interaction,
@@ -7784,7 +7803,7 @@ GU-TAP System
                                 {
                                     'Ticket ID': ticket_id_int,
                                     "Date of Interaction": date_int.strftime("%Y-%m-%d"),  # Convert to string
-                                    "Type of Interaction": type_interaction,  # legacy report compatibility
+                                    "Type of Interaction": "",  # new records use the two new fields
                                     "Interaction Type": type_interaction,
                                     "TA / Activity Category": activity_category,
                                     "Focus Area": focus_area_interaction,
@@ -10617,7 +10636,7 @@ GU-TAP System
                                         {
                                             "Ticket ID": ra_ticket_int,
                                             "Date of Interaction": ra_date_int.strftime("%Y-%m-%d"),
-                                            "Type of Interaction": ra_type_int,  # legacy report compatibility
+                                            "Type of Interaction": "",  # new records use the two new fields
                                             "Interaction Type": ra_type_int,
                                             "TA / Activity Category": ra_activity_category,
                                             "Focus Area": ra_focus_area,

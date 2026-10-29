@@ -596,8 +596,9 @@ def portal_pln_sessions(df_inter: pd.DataFrame) -> list[dict[str, Any]]:
         date_str = date.strftime("%Y-%m-%d") if pd.notna(date) else ""
         summary = clean_cell(row.get("Short Summary"))
         # Without a date or summary, joining unrelated rows into one session would be unsafe.
-        submitter = clean_cell(row.get("_session_submitter")).casefold()
-        key = (date_str, summary.casefold(), submitter) if date_str and summary else ("unique", pos)
+        channel = clean_cell(row.get("Interaction Type (Resolved)")).casefold()
+        key = (date_str, INTERACTION_CATEGORY_PLN.casefold(), channel, summary.casefold()) \
+            if date_str and summary else ("unique", pos)
         if key not in buckets:
             buckets[key] = {
                 "id": None, "date": date_str, "month": date_str[:7],
@@ -625,6 +626,74 @@ def portal_pln_sessions(df_inter: pd.DataFrame) -> list[dict[str, Any]]:
         event["jurisdiction_count"] = len(event["jurisdictions"])
         event["focus_area"] = "; ".join(event.pop("_focuses", [])) or "Topic not recorded"
     return events
+
+
+PORTAL_GROUP_CATEGORIES = {
+    "Webinar", "Office Hours", "Intensive Technical Assistance Workshop",
+    "Peer Learning Network Meeting (PLN)", "Ad-Hoc Peer Exchange",
+}
+SESSION_CHANNELS = {"online meeting (virtual)", "online meeting", "in-person meeting"}
+
+
+def portal_group_sessions(df_inter: pd.DataFrame) -> list[dict[str, Any]]:
+    """One session per dated activity/channel/summary, not per jurisdiction row.
+
+    Keeps the separate PLNs' conservative screening for historical entries.
+    Every exported group session includes all matched jurisdictions. If two
+    legitimately different sessions share identical values, the sheet has no
+    stable session identifier that can distinguish them.
+    """
+    events = portal_pln_sessions(df_inter)
+    for item in events:
+        item["category"] = INTERACTION_CATEGORY_PLN
+    if df_inter.empty:
+        return events
+    groups: dict[tuple, dict[str, Any]] = {}
+    for pos, (_, row) in enumerate(df_inter.iterrows()):
+        category = clean_cell(row.get("TA / Activity Category (Resolved)"))
+        channel = clean_cell(row.get("Interaction Type (Resolved)"))
+        kind = "Ad-Hoc Peer Exchange" if channel.casefold() == "ad-hoc peer exchange" else category
+        if kind not in PORTAL_GROUP_CATEGORIES or kind == INTERACTION_CATEGORY_PLN:
+            continue
+        channel_lower = channel.casefold()
+        summary = clean_cell(row.get("Short Summary"))
+        # An email or a document about an event is not itself a held session.
+        if kind != "Ad-Hoc Peer Exchange" and channel_lower and channel_lower not in SESSION_CHANNELS:
+            if not (kind == "Office Hours" and channel_lower == "phone call"):
+                continue
+        if not channel_lower:
+            # Historical rows with an activity label but no meeting channel need
+            # positive evidence that the activity actually happened.
+            if not re.search(r"\b(held|hosted|facilitated|conducted|attended|joined|convened)\b", summary, re.I):
+                continue
+        date = pd.to_datetime(row.get("Date of Interaction"), errors="coerce")
+        day = date.strftime("%Y-%m-%d") if pd.notna(date) else ""
+        key = (day, kind.casefold(), channel_lower, summary.casefold()) \
+            if day and summary else ("other-unique", pos)
+        if key not in groups:
+            groups[key] = {
+                "id": None, "date": day, "month": day[:7], "category": kind,
+                "location": channel, "status": "Completed", "focus_area": "",
+                "notes": summary, "jurisdictions": [], "jurisdiction_count": 0,
+                "complete": True, "ticket_ids": [], "_focuses": [],
+            }
+        event = groups[key]
+        jur = clean_cell(row.get("Jurisdiction (Standardized)"))
+        if jur and jur.casefold() not in JURISDICTION_BLANKS and jur != "Unknown" and jur not in event["jurisdictions"]:
+            event["jurisdictions"].append(jur)
+        focus = clean_cell(row.get("Focus Area (Resolved)"))
+        if focus and focus not in event["_focuses"]:
+            event["_focuses"].append(focus)
+        ticket = clean_cell(row.get("Ticket ID"))
+        if ticket and ticket.casefold() != "no ticket id" and ticket not in event["ticket_ids"]:
+            event["ticket_ids"].append(ticket)
+    for i, event in enumerate(groups.values(), 1):
+        event["id"] = i
+        event["jurisdictions"].sort()
+        event["jurisdiction_count"] = len(event["jurisdictions"])
+        event["focus_area"] = "; ".join(event.pop("_focuses")) or "Topic not recorded"
+        events.append(event)
+    return sorted(events, key=lambda e: (e["date"], e["category"], e["notes"]), reverse=True)
 
 def normalize_deliveries(df_del: pd.DataFrame) -> pd.DataFrame:
     """
@@ -952,7 +1021,8 @@ def compute_payload(
     # ---- Historical ITAs and confirmed portal PLN sessions -------------
     spelling_map = {j.casefold(): j for j in engaged_jurisdictions}
     ita_records = activity_records(df_ita, spelling_map) if df_ita is not None and not df_ita.empty else []
-    pln_records = portal_pln_sessions(df_inter)
+    group_session_records = portal_group_sessions(df_inter)
+    pln_records = [r for r in group_session_records if r["category"] == INTERACTION_CATEGORY_PLN]
 
     # Jurisdictions that only appear via an ITA/PLN still deserve a filter entry.
     activity_jurs = set()
@@ -994,6 +1064,7 @@ def compute_payload(
         "deliveries": del_rec.to_dict(orient="records"),
         "itas": ita_records,
         "plns": pln_records,
+        "group_sessions": group_session_records,
     }
 
 
@@ -1349,7 +1420,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="tcard" style="--accent: var(--c-interactions);">
       <div class="tlabel">Interactions</div>
       <div class="tvalue" id="totInteractions">&mdash;</div>
-      <div class="ttotal">Meetings, calls &amp; emails</div>
+      <div class="ttotal">Jurisdiction-level interaction records</div>
       <div class="tfiltered" id="fltInteractions" style="display:none;"></div>
     </div>
     <div class="tcard" style="--accent: var(--c-deliveries);">
@@ -1383,7 +1454,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="kpi"><div class="label">Completed</div><div class="value" id="kpiCompleted">&mdash;</div></div>
       <div class="kpi"><div class="label">Completion rate</div><div class="value" id="kpiRate">&mdash;</div></div>
       <div class="kpi"><div class="label">Avg days to close</div><div class="value" id="kpiClose">&mdash;</div></div>
-      <div class="kpi"><div class="label">Interactions</div><div class="value" id="kpiInteractions">&mdash;</div></div>
+      <div class="kpi"><div class="label">Interaction records</div><div class="value" id="kpiInteractions">&mdash;</div></div>
       <div class="kpi"><div class="label">Deliveries</div><div class="value" id="kpiDeliveries">&mdash;</div></div>
       <div class="kpi"><div class="label">ITAs</div><div class="value" id="kpiITA">&mdash;</div></div>
       <div class="kpi"><div class="label">PLNs</div><div class="value" id="kpiPLN">&mdash;</div></div>
@@ -1530,7 +1601,15 @@ HTML_TEMPLATE = r"""<!doctype html>
         </table></div>
       </div>
     </div>
-    <p class="subnote">Historical activities without a recorded TA category appear as Unclassified; unknown meeting formats appear as Not recorded. Focus Area uses the interaction value, or its linked ticket when available.</p>
+    <p class="subnote">Interactions are jurisdiction-level records: a session involving five jurisdictions may have five rows. Session counts below combine matching jurisdiction rows into one activity.</p>
+    <div class="actHead" style="margin-top:18px;border-left:4px solid var(--s4);">
+      <div class="name">Group sessions logged in the TA Portal</div>
+    </div>
+    <div class="tableWrap short"><table>
+      <thead><tr><th>Activity</th><th class="num">Sessions</th><th class="num">Jurisdictions reached</th></tr></thead>
+      <tbody id="portalGroupSessionTbody"></tbody>
+    </table></div>
+    <p class="subnote">Sessions are grouped by date, activity, interaction type and summary. The separate historical intensive-TA workbook is not included in this portal-only table.</p>
   </div>
 
   <!-- ============ ITA / PLN ============ -->
@@ -1845,7 +1924,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     function activityMatchesSearch(a, f){
       if (!f.q) return true;
-      return blobHas([a.id, a.location, a.focus_area, a.notes, a.status,
+      return blobHas([a.id, a.category, a.location, a.focus_area, a.notes, a.status,
                       (a.ticket_ids || []).join(" "), (a.jurisdictions || []).join(" ")], f.q);
     }
 
@@ -2291,6 +2370,20 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderRows("interactionCategoryTbody", "TA / Activity Category (Resolved)", "Unclassified");
       renderRows("interactionChannelTbody", "Interaction Type (Resolved)", "Not recorded");
       renderRows("interactionFocusTbody", "Focus Area (Resolved)", "Not recorded");
+      const sessions = filteredActivities(PAYLOAD.group_sessions, getFilters());
+      const categories = ["Peer Learning Network Meeting (PLN)", "Webinar", "Office Hours",
+        "Intensive Technical Assistance Workshop", "Ad-Hoc Peer Exchange"];
+      const table = document.getElementById("portalGroupSessionTbody");
+      table.innerHTML = "";
+      categories.forEach(label => {
+        const subset = sessions.filter(s => s.category === label);
+        const jurisdictions = new Set();
+        subset.forEach(s => (s.jurisdictions || []).forEach(j => jurisdictions.add(j)));
+        const tr = table.insertRow();
+        tr.insertCell().textContent = label;
+        const c1 = tr.insertCell(); c1.className = "num"; c1.textContent = String(subset.length);
+        const c2 = tr.insertCell(); c2.className = "num"; c2.textContent = String(jurisdictions.size);
+      });
     }
 
     /* ===================== ITA / PLN tables ===================== */
