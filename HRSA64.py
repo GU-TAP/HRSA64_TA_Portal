@@ -589,7 +589,6 @@ def render_interaction_classification(ticket_id, df_main, key_prefix):
             "Focus Area *", TA_FOCUS_AREA_OPTIONS, index=None,
             placeholder="Select a focus area for this standalone activity...",
             key=f"{key_prefix}_focus",
-            help="Required only for interactions without an associated ticket.",
         ) or ""
         if focus_area == "Other":
             focus_area = st.text_input(
@@ -603,9 +602,7 @@ def render_interaction_classification(ticket_id, df_main, key_prefix):
         if not matching.empty and pd.notna(matching.iloc[0]):
             focus_area = str(matching.iloc[0]).strip()
         if focus_area:
-            st.caption(f"Focus Area from ticket {ticket_id}: {focus_area}")
-        else:
-            st.caption("Focus Area is linked to the ticket; no additional entry required.")
+            st.markdown(f"**Focus Area:** {html.escape(focus_area)}")
     return selected_channel or "", selected_category or "", focus_area
 
 
@@ -722,63 +719,80 @@ def build_activity_report(df_interactions, df_main=None):
 
 
 def render_group_activity_section(df_interactions, key_prefix, df_deliveries=None, df_main=None):
-    """Team-wide group activity summary and report-ready export."""
-    st.markdown("### 👥 Group Activities (PLNs, Webinars, Office Hours & Workshops)")
-    st.caption("Logged by anyone on the team and visible to everyone; categorized by activity rather than meeting format.")
+    """Display shared activities and export event-level records without nested expanders."""
+    st.markdown("### Group Activities")
     grouped = group_interactions(df_interactions)
+
     if grouped is None or grouped.empty:
-        st.info("No group activities have been logged yet.")
-        return
-    view = grouped.copy()
-    if "Date of Interaction" in view.columns:
-        date_values = pd.to_datetime(view["Date of Interaction"], errors="coerce")
-        recent = view.loc[date_values >= pd.Timestamp(datetime.now().date() - timedelta(days=30))]
-        view = view.loc[date_values.sort_values(ascending=False, na_position="last").index]
+        st.info("No group activities have been logged.")
     else:
-        recent = view.iloc[0:0]
-    cols = st.columns(3)
-    cols[0].metric("Group activities", _distinct_activity_count(view))
-    cols[1].metric("Last 30 days", _distinct_activity_count(recent))
-    reached = view.get("Jurisdiction", pd.Series(dtype=str)).astype(str).str.strip().replace("", pd.NA).dropna().nunique()
-    cols[2].metric("Jurisdictions reached", int(reached))
-    available = sorted(view["TA / Activity Category"].fillna("").astype(str).unique())
-    available = [x for x in available if x.strip()]
-    selected = st.multiselect("Filter by TA / Activity Category", available, default=available, key=f"{key_prefix}_group_category_filter")
-    if selected:
-        view = view.loc[view["TA / Activity Category"].isin(selected)]
-    elif available:
-        view = view.iloc[0:0]
-    st.caption("Each row represents one jurisdiction; activity counts above count each event once.")
-    show_df(view.drop(columns=["Submission Date"], errors="ignore").reset_index(drop=True))
-    export = build_activity_report(view, df_main)
-    st.download_button(
-        "Download group activity summary (CSV)",
-        export.to_csv(index=False).encode("utf-8-sig"),
-        file_name="TA_Portal_group_activities.csv", mime="text/csv",
-        key=f"{key_prefix}_group_export",
-    )
-    with st.expander("📊 Portal reporting exports (replaces manual PLN totals)"):
-        all_activities = build_activity_report(df_interactions, df_main)
-        st.caption("Event-level data (one row per activity, not per jurisdiction); old PLN rows retain unknown meeting formats as blank.")
-        if not all_activities.empty:
-            category_counts = all_activities["TA / Activity Category"].replace("", "Unclassified (legacy)").value_counts()
-            show_df(category_counts.rename_axis("TA / Activity Category").reset_index(name="Unique activities"))
-        st.download_button(
-            "Download all portal interaction events (CSV)",
-            all_activities.to_csv(index=False).encode("utf-8-sig"),
-            file_name="TA_Portal_interaction_events.csv", mime="text/csv",
-            key=f"{key_prefix}_all_interaction_report",
+        view = grouped.copy()
+        if "Date of Interaction" in view.columns:
+            date_values = pd.to_datetime(view["Date of Interaction"], errors="coerce")
+            recent_cut = pd.Timestamp(datetime.now().date() - timedelta(days=30))
+            recent = view.loc[date_values >= recent_cut]
+            view = view.loc[date_values.sort_values(ascending=False, na_position="last").index]
+        else:
+            recent = view.iloc[0:0]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total group activities", _distinct_activity_count(view))
+        m2.metric("Last 30 days", _distinct_activity_count(recent))
+        jurisdictions = (
+            view.get("Jurisdiction", pd.Series(dtype=str))
+            .fillna("").astype(str).str.strip()
+            .replace({"": pd.NA, "nan": pd.NA, "none": pd.NA})
+            .dropna().nunique()
         )
-        if df_deliveries is not None and not df_deliveries.empty:
-            deliveries = df_deliveries.copy()
-            if "Type of Delivery" in deliveries.columns:
-                deliveries["Standardized Delivery Type"] = deliveries["Type of Delivery"].map(canonical_delivery_type)
-            st.download_button(
-                "Download deliveries with standardized categories (CSV)",
-                deliveries.to_csv(index=False).encode("utf-8-sig"),
-                file_name="TA_Portal_deliveries_standardized.csv", mime="text/csv",
-                key=f"{key_prefix}_delivery_report",
-            )
+        m3.metric("Jurisdictions reached", int(jurisdictions))
+
+        available = sorted(
+            label for label in view["TA / Activity Category"].fillna("")
+            .astype(str).str.strip().unique() if label
+        )
+        selected = st.multiselect(
+            "TA / Activity Category", available, default=available,
+            key=f"{key_prefix}_group_category_filter",
+        )
+        view = view.loc[view["TA / Activity Category"].isin(selected)]
+        display = view.drop(
+            columns=["Submission Date", "Type of Interaction", "Activity ID"],
+            errors="ignore",
+        )
+        show_df(display.reset_index(drop=True))
+        st.download_button(
+            "Download group activities (CSV)",
+            build_activity_report(view, df_main).to_csv(index=False).encode("utf-8-sig"),
+            file_name="TA_Portal_group_activities.csv", mime="text/csv",
+            key=f"{key_prefix}_group_export",
+        )
+
+    # Report downloads are regular elements: this function runs inside a parent
+    # interaction-log expander, where a second expander would crash Streamlit.
+    st.markdown("#### Activity Reports")
+    all_activities = build_activity_report(df_interactions, df_main)
+    if not all_activities.empty:
+        category_counts = (
+            all_activities["TA / Activity Category"].fillna("")
+            .replace("", "Not categorized").value_counts()
+        )
+        show_df(category_counts.rename_axis("TA / Activity Category").reset_index(name="Total activities"))
+    st.download_button(
+        "Download interaction report (CSV)",
+        all_activities.to_csv(index=False).encode("utf-8-sig"),
+        file_name="TA_Portal_interaction_events.csv", mime="text/csv",
+        key=f"{key_prefix}_all_interaction_report",
+    )
+    if df_deliveries is not None and not df_deliveries.empty:
+        deliveries = df_deliveries.copy()
+        if "Type of Delivery" in deliveries.columns:
+            deliveries["Standardized Delivery Type"] = deliveries["Type of Delivery"].map(canonical_delivery_type)
+        st.download_button(
+            "Download delivery report (CSV)",
+            deliveries.to_csv(index=False).encode("utf-8-sig"),
+            file_name="TA_Portal_deliveries_standardized.csv", mime="text/csv",
+            key=f"{key_prefix}_delivery_report",
+        )
 
 
 # --- Federal mileage reimbursement ------------------------------------------------------
@@ -7953,7 +7967,7 @@ GU-TAP System
                     """, unsafe_allow_html=True)
 
                     # Start with Anticipated Delivery
-                    anticipated_delivery = st.selectbox("Anticipated Delivery *", options=["Meeting notes", "Dashboard", "Peer learning facilitation", "TA meeting", "Other"], index=0) 
+                    anticipated_delivery = st.selectbox("Anticipated Delivery *", options=["Meeting notes", "Dashboard", "Peer to peer knowledge sharing", "TA meeting", "Other"], index=0) 
                     if anticipated_delivery == "Other":
                         anticipated_delivery_other = st.text_input("Please specify the Anticipated Delivery *")
                         if anticipated_delivery_other:
