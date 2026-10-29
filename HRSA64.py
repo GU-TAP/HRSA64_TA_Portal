@@ -665,61 +665,8 @@ def _distinct_activity_count(df_rows):
     return len(set(signatures))
 
 
-def build_activity_report(df_interactions, df_main=None):
-    """One row per interaction event for reporting, without double-counting jurisdictions.
-
-    Source of truth is the portal Interaction and Delivery sheets, not the old manual
-    Additional TA Activities sheet. Does NOT merge or alter live sheet data.
-    """
-    source = normalize_interaction_dataframe(df_interactions)
-    if source.empty:
-        return pd.DataFrame(columns=["Activity ID", "Ticket ID", "Date", "TA / Activity Category", "Interaction Type", "Focus Area", "Jurisdictions Reached", "Submitted By", "Short Summary"])
-    report = []
-    for _, row in source.iterrows():
-        activity_id = str(row.get("Activity ID", "") or "").strip()
-        event_key = ("id", activity_id) if activity_id and activity_id.lower() not in ("nan", "none") else (
-            "legacy", str(row.get("Date of Interaction", "")).strip(),
-            str(row.get("TA / Activity Category", "")).strip(),
-            str(row.get("Type of Interaction", "")).strip(),
-            str(row.get("Short Summary", "")).strip(),
-            str(row.get("Submitted By", "")).strip(),
-        )
-        report.append((event_key, row))
-    events = {}
-    for event_key, row in report:
-        if event_key not in events:
-            events[event_key] = {
-                "Activity ID": row.get("Activity ID", ""),
-                "Ticket ID": row.get("Ticket ID", ""),
-                "Date": row.get("Date of Interaction", ""),
-                "TA / Activity Category": row.get("TA / Activity Category", ""),
-                "Interaction Type": row.get("Interaction Type", ""),
-                "Focus Area": row.get("Focus Area", ""),
-                "Jurisdictions Reached": set(),
-                "Submitted By": row.get("Submitted By", ""),
-                "Short Summary": row.get("Short Summary", ""),
-            }
-        juris = str(row.get("Jurisdiction", "") or "").strip()
-        if juris and juris.lower() not in ("nan", "none"):
-            events[event_key]["Jurisdictions Reached"].add(juris)
-    output = []
-    for event in events.values():
-        event["Jurisdictions Reached"] = "; ".join(sorted(event["Jurisdictions Reached"]))
-        # Read-only ticket lookup for historical records that lack an interaction-level
-        # focus area. Never overwrite the existing interaction row with this inference.
-        ticket = str(event.get("Ticket ID", "") or "").strip()
-        current_focus = str(event.get("Focus Area", "") or "").strip()
-        if not current_focus and ticket and ticket != "No Ticket ID" and df_main is not None:
-            if {"Ticket ID", "Focus Area"}.issubset(df_main.columns):
-                matching = df_main.loc[df_main["Ticket ID"].astype(str).str.strip() == ticket, "Focus Area"]
-                if not matching.empty and pd.notna(matching.iloc[0]):
-                    event["Focus Area"] = str(matching.iloc[0]).strip()
-        output.append(event)
-    return pd.DataFrame(output)
-
-
-def render_group_activity_section(df_interactions, key_prefix, df_deliveries=None, df_main=None):
-    """Display shared activities and export event-level records without nested expanders."""
+def render_group_activity_section(df_interactions, key_prefix):
+    """Show shared group activities in the interaction log."""
     st.markdown("### Group Activities")
     grouped = group_interactions(df_interactions)
 
@@ -760,39 +707,6 @@ def render_group_activity_section(df_interactions, key_prefix, df_deliveries=Non
             errors="ignore",
         )
         show_df(display.reset_index(drop=True))
-        st.download_button(
-            "Download group activities (CSV)",
-            build_activity_report(view, df_main).to_csv(index=False).encode("utf-8-sig"),
-            file_name="TA_Portal_group_activities.csv", mime="text/csv",
-            key=f"{key_prefix}_group_export",
-        )
-
-    # Report downloads are regular elements: this function runs inside a parent
-    # interaction-log expander, where a second expander would crash Streamlit.
-    st.markdown("#### Activity Reports")
-    all_activities = build_activity_report(df_interactions, df_main)
-    if not all_activities.empty:
-        category_counts = (
-            all_activities["TA / Activity Category"].fillna("")
-            .replace("", "Not categorized").value_counts()
-        )
-        show_df(category_counts.rename_axis("TA / Activity Category").reset_index(name="Total activities"))
-    st.download_button(
-        "Download interaction report (CSV)",
-        all_activities.to_csv(index=False).encode("utf-8-sig"),
-        file_name="TA_Portal_interaction_events.csv", mime="text/csv",
-        key=f"{key_prefix}_all_interaction_report",
-    )
-    if df_deliveries is not None and not df_deliveries.empty:
-        deliveries = df_deliveries.copy()
-        if "Type of Delivery" in deliveries.columns:
-            deliveries["Standardized Delivery Type"] = deliveries["Type of Delivery"].map(canonical_delivery_type)
-        st.download_button(
-            "Download delivery report (CSV)",
-            deliveries.to_csv(index=False).encode("utf-8-sig"),
-            file_name="TA_Portal_deliveries_standardized.csv", mime="text/csv",
-            key=f"{key_prefix}_delivery_report",
-        )
 
 
 # --- Federal mileage reimbursement ------------------------------------------------------
@@ -5714,7 +5628,7 @@ else:
                                 </div>
                             """, unsafe_allow_html=True)
 
-                        render_group_activity_section(df_int, "coord", df_del, df)
+                        render_group_activity_section(df_int, "coord")
 
                         # Middle section: View Interactions by Ticket ID
                         st.markdown("""
@@ -7609,7 +7523,7 @@ GU-TAP System
                             </div>
                         """, unsafe_allow_html=True)
 
-                    render_group_activity_section(df_int, "staff", df_del, df)
+                    render_group_activity_section(df_int, "staff")
 
                     # Middle section: View Interactions by Ticket ID
                     st.markdown("""
