@@ -14,6 +14,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
+import uuid
 import smtplib
 from email.message import EmailMessage
 from mailjet_rest import Client
@@ -483,182 +484,301 @@ creds_json = json.dumps(credentials)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
 client = gspread.authorize(creds)
 
-# --- Interaction logging ----------------------------------------------------------------
+# --- Standardized interaction logging (legacy-safe, October 2026) ----------------------
+# Keep the existing "Type of Interaction" sheet column for older reports. New records
+# additionally write "Interaction Type" (communication channel) and "TA / Activity
+# Category" (purpose). Never infer a communication channel for old PLN/webinar records.
 INTERACTION_TYPES = [
-    "Email", "Phone Call", "In-Person Meeting", "Online Meeting",
-    "Peer Learning Meetings (PLNs)", "Webinars", "Office Hours", "Other",
+    "E-mail", "Phone Call", "Online Meeting (Virtual)", "In-Person Meeting",
+    "Document or Material Sharing", "Other",
+]
+TA_ACTIVITY_CATEGORIES = [
+    "Peer Learning Network Meeting (PLN)", "1-on-1 TA", "Office Hours",
+    "Webinar", "Intensive Technical Assistance Workshop", "Other",
+]
+TA_FOCUS_AREA_OPTIONS = [
+    "Housing", "Prevention", "Substance Abuse", "Rapid Start",
+    "Telehealth/Telemedicine", "Data Sharing", "Evaluation",
+    "Implementation Science", "Continuous Quality Improvement", "Sustainability",
+    "Sub-recipient Monitoring", "Procurement", "Work Plan and Budget", "Other",
+]
+SHARED_ACTIVITY_CATEGORIES = {
+    "Peer Learning Network Meeting (PLN)", "Office Hours", "Webinar",
+    "Intensive Technical Assistance Workshop",
+}
+LEGACY_ACTIVITY_CATEGORIES = {
+    "peer learning meetings (plns)": "Peer Learning Network Meeting (PLN)",
+    "peer learning meeting (pln)": "Peer Learning Network Meeting (PLN)",
+    "webinars": "Webinar", "webinar": "Webinar",
+    "office hours": "Office Hours",
+}
+LEGACY_INTERACTION_CHANNELS = {
+    "email": "E-mail", "e-mail": "E-mail", "phone call": "Phone Call",
+    "online meeting": "Online Meeting (Virtual)",
+    "online meeting (virtual)": "Online Meeting (Virtual)",
+    "in-person meeting": "In-Person Meeting",
+    "document or material sharing": "Document or Material Sharing",
+}
+DELIVERY_TYPE_LABELS = {
+    "peer learning facilitation": "Peer to peer knowledge sharing",
+    "peer to peer knowledge sharing": "Peer to peer knowledge sharing",
+}
+DELIVERY_TYPES = [
+    "Report", "Email Reply", "Dashboard", "New Data Points",
+    "Peer to peer knowledge sharing", "TA Meeting", "Other",
 ]
 
-# Group activities belong to the whole team, so everyone sees them regardless of who
-# happened to log the entry. One-to-one interactions stay with their submitter.
-SHARED_INTERACTION_TYPES = (
-    "Peer Learning Meetings (PLNs)", "Webinars", "Office Hours",
-)
+
+def canonical_delivery_type(value):
+    """Display/report new wording without rewriting historical Delivery records."""
+    raw = str(value or "").strip()
+    return DELIVERY_TYPE_LABELS.get(raw.casefold(), raw)
+
+
+def normalize_interaction_dataframe(data):
+    """Add new schema columns on a copy; preserve original legacy values and unknowns.
+
+    Old records used Type of Interaction for either channel OR activity. A PLN alone
+    does not tell us whether it was virtual/in-person, so leave its new channel blank.
+    """
+    result = data.copy() if data is not None else pd.DataFrame()
+    if "Type of Interaction" not in result.columns:
+        result["Type of Interaction"] = ""
+    for col in ("Interaction Type", "TA / Activity Category", "Focus Area", "Activity ID"):
+        if col not in result.columns:
+            result[col] = ""
+    legacy = result["Type of Interaction"].fillna("").astype(str).str.strip().str.casefold()
+    for new_col, mapping in (
+        ("Interaction Type", LEGACY_INTERACTION_CHANNELS),
+        ("TA / Activity Category", LEGACY_ACTIVITY_CATEGORIES),
+    ):
+        existing = result[new_col].fillna("").astype(str).str.strip()
+        missing = existing.eq("") | existing.str.lower().isin(["nan", "none"])
+        result.loc[missing, new_col] = legacy[missing].map(mapping).fillna("")
+    return result
+
+
+def render_interaction_classification(ticket_id, df_main, key_prefix):
+    """Required activity/channel fields; focus area only needs manual entry without ticket."""
+    c1, c2 = st.columns(2)
+    with c1:
+        selected_channel = st.selectbox(
+            "Interaction Type *", INTERACTION_TYPES, index=None,
+            placeholder="Select how the interaction took place...",
+            key=f"{key_prefix}_channel",
+        )
+        if selected_channel == "Other":
+            selected_channel = st.text_input(
+                "Please specify the Interaction Type *", key=f"{key_prefix}_channel_other"
+            ).strip()
+    with c2:
+        selected_category = st.selectbox(
+            "TA / Activity Category *", TA_ACTIVITY_CATEGORIES, index=None,
+            placeholder="Select the purpose of this activity...",
+            key=f"{key_prefix}_category",
+        )
+        if selected_category == "Other":
+            selected_category = st.text_input(
+                "Please specify the TA / Activity Category *",
+                key=f"{key_prefix}_category_other",
+            ).strip()
+
+    focus_area = ""
+    if ticket_id == "No Ticket ID":
+        focus_area = st.selectbox(
+            "Focus Area *", TA_FOCUS_AREA_OPTIONS, index=None,
+            placeholder="Select a focus area for this standalone activity...",
+            key=f"{key_prefix}_focus",
+            help="Required only for interactions without an associated ticket.",
+        ) or ""
+        if focus_area == "Other":
+            focus_area = st.text_input(
+                "Please specify the Focus Area *", key=f"{key_prefix}_focus_other"
+            ).strip()
+    elif ticket_id:
+        matching = df_main.loc[
+            df_main["Ticket ID"].astype(str).str.strip() == str(ticket_id).strip(),
+            "Focus Area",
+        ] if {"Ticket ID", "Focus Area"}.issubset(df_main.columns) else pd.Series(dtype=str)
+        if not matching.empty and pd.notna(matching.iloc[0]):
+            focus_area = str(matching.iloc[0]).strip()
+        if focus_area:
+            st.caption(f"Focus Area from ticket {ticket_id}: {focus_area}")
+        else:
+            st.caption("Focus Area is linked to the ticket; no additional entry required.")
+    return selected_channel or "", selected_category or "", focus_area
+
+
+def _is_shared_activity(data):
+    normalized = normalize_interaction_dataframe(data)
+    allowed = {category.casefold() for category in SHARED_ACTIVITY_CATEGORIES}
+    return normalized["TA / Activity Category"].fillna("").astype(str).str.strip().str.casefold().isin(allowed)
 
 
 def interactions_visible_to(df_interactions, person_name):
-    """A person's own interactions, plus every shared group activity."""
+    """Own interactions plus group activities visible to all staff, incl. old records."""
     if df_interactions is None or getattr(df_interactions, "empty", True):
         return df_interactions
-    mask = pd.Series(False, index=df_interactions.index)
-    if "Submitted By" in df_interactions.columns:
-        mask = mask | (
-            df_interactions["Submitted By"].astype(str).str.strip()
-            == str(person_name or "").strip()
-        )
-    if "Type of Interaction" in df_interactions.columns:
-        shared = {t.casefold() for t in SHARED_INTERACTION_TYPES}
-        mask = mask | (
-            df_interactions["Type of Interaction"]
-            .astype(str).str.strip().str.casefold().isin(shared)
-        )
-    return df_interactions[mask].copy()
+    result = normalize_interaction_dataframe(df_interactions)
+    owners = result.get("Submitted By", pd.Series("", index=result.index)).fillna("").astype(str)
+    mask = owners.str.strip().eq(str(person_name or "").strip()) | _is_shared_activity(result)
+    return result[mask].copy()
 
 
 def own_interactions(df_interactions, person_name):
-    """
-    A person's own one-to-one interactions only.
-
-    Group activities are deliberately excluded: they are team-wide and get their own
-    section, so they don't bury someone's individual records.
-    """
+    """Individual interactions only, excluding group activities, including historical ones."""
     if df_interactions is None or getattr(df_interactions, "empty", True):
         return df_interactions
-    mask = pd.Series(True, index=df_interactions.index)
-    if "Submitted By" in df_interactions.columns:
-        mask &= (
-            df_interactions["Submitted By"].astype(str).str.strip()
-            == str(person_name or "").strip()
-        )
-    if "Type of Interaction" in df_interactions.columns:
-        shared = {t.casefold() for t in SHARED_INTERACTION_TYPES}
-        mask &= ~(
-            df_interactions["Type of Interaction"]
-            .astype(str).str.strip().str.casefold().isin(shared)
-        )
-    return df_interactions[mask].copy()
+    result = normalize_interaction_dataframe(df_interactions)
+    owners = result.get("Submitted By", pd.Series("", index=result.index)).fillna("").astype(str)
+    mask = owners.str.strip().eq(str(person_name or "").strip()) & ~_is_shared_activity(result)
+    return result[mask].copy()
 
 
 def group_interactions(df_interactions):
-    """Every shared group activity (PLN / webinar / office hours), whoever logged it."""
+    """All PLN / webinar / office-hours / workshop records for team-wide visibility."""
     if df_interactions is None or getattr(df_interactions, "empty", True):
         return df_interactions
-    if "Type of Interaction" not in df_interactions.columns:
-        return df_interactions.iloc[0:0].copy()
-    shared = {t.casefold() for t in SHARED_INTERACTION_TYPES}
-    mask = (
-        df_interactions["Type of Interaction"]
-        .astype(str).str.strip().str.casefold().isin(shared)
-    )
-    return df_interactions[mask].copy()
+    result = normalize_interaction_dataframe(df_interactions)
+    return result[_is_shared_activity(result)].copy()
 
 
 def _distinct_activity_count(df_rows):
-    """
-    Count events, not rows.
+    """Distinct event count: prefer stable Activity ID, fallback to historical signature.
 
-    A multi-jurisdiction activity is stored as one row per jurisdiction, so counting
-    rows would overstate how much happened. An event is one date + type + summary +
-    submitter.
+    Multiple jurisdictions are separate rows for one event. Historic rows lack IDs.
     """
     if df_rows is None or getattr(df_rows, "empty", True):
         return 0
-    keys = [c for c in ("Date of Interaction", "Type of Interaction",
-                        "Short Summary", "Submitted By") if c in df_rows.columns]
-    if not keys:
-        return len(df_rows)
-    return int(df_rows[keys].astype(str).drop_duplicates().shape[0])
+    result = normalize_interaction_dataframe(df_rows)
+    signatures = []
+    for _, row in result.iterrows():
+        activity_id = str(row.get("Activity ID", "") or "").strip()
+        if activity_id and activity_id.lower() not in ("nan", "none"):
+            signatures.append(("id", activity_id))
+        else:
+            signatures.append((
+                "legacy",
+                str(row.get("Date of Interaction", "")).strip(),
+                str(row.get("TA / Activity Category", "")).strip(),
+                str(row.get("Type of Interaction", "")).strip(),
+                str(row.get("Short Summary", "")).strip(),
+                str(row.get("Submitted By", "")).strip(),
+            ))
+    return len(set(signatures))
 
 
-def render_group_activity_section(df_interactions, key_prefix):
-    """Standalone section for PLNs, webinars and office hours, shared across the team."""
-    st.markdown(
-        """
-        <div style='background: #f3e5f5; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-                    padding: 1.5em; margin-bottom: 1.5em; margin-top: 2em;'>
-            <h3 style='color: #4a148c; font-family: "Segoe UI", sans-serif; font-weight: 700;
-                       margin-bottom: 0.3em; text-align: center;'>
-                👥 Group Activities (PLNs, Webinars, Office Hours)
-            </h3>
-            <p style='color: #6a1b9a; text-align: center; margin: 0; font-size: 0.9em;'>
-                Logged by anyone on the team and visible to everyone - kept separate from
-                your own one-to-one interactions.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def build_activity_report(df_interactions, df_main=None):
+    """One row per interaction event for reporting, without double-counting jurisdictions.
 
+    Source of truth is the portal Interaction and Delivery sheets, not the old manual
+    Additional TA Activities sheet. Does NOT merge or alter live sheet data.
+    """
+    source = normalize_interaction_dataframe(df_interactions)
+    if source.empty:
+        return pd.DataFrame(columns=["Activity ID", "Ticket ID", "Date", "TA / Activity Category", "Interaction Type", "Focus Area", "Jurisdictions Reached", "Submitted By", "Short Summary"])
+    report = []
+    for _, row in source.iterrows():
+        activity_id = str(row.get("Activity ID", "") or "").strip()
+        event_key = ("id", activity_id) if activity_id and activity_id.lower() not in ("nan", "none") else (
+            "legacy", str(row.get("Date of Interaction", "")).strip(),
+            str(row.get("TA / Activity Category", "")).strip(),
+            str(row.get("Type of Interaction", "")).strip(),
+            str(row.get("Short Summary", "")).strip(),
+            str(row.get("Submitted By", "")).strip(),
+        )
+        report.append((event_key, row))
+    events = {}
+    for event_key, row in report:
+        if event_key not in events:
+            events[event_key] = {
+                "Activity ID": row.get("Activity ID", ""),
+                "Ticket ID": row.get("Ticket ID", ""),
+                "Date": row.get("Date of Interaction", ""),
+                "TA / Activity Category": row.get("TA / Activity Category", ""),
+                "Interaction Type": row.get("Interaction Type", ""),
+                "Focus Area": row.get("Focus Area", ""),
+                "Jurisdictions Reached": set(),
+                "Submitted By": row.get("Submitted By", ""),
+                "Short Summary": row.get("Short Summary", ""),
+            }
+        juris = str(row.get("Jurisdiction", "") or "").strip()
+        if juris and juris.lower() not in ("nan", "none"):
+            events[event_key]["Jurisdictions Reached"].add(juris)
+    output = []
+    for event in events.values():
+        event["Jurisdictions Reached"] = "; ".join(sorted(event["Jurisdictions Reached"]))
+        # Read-only ticket lookup for historical records that lack an interaction-level
+        # focus area. Never overwrite the existing interaction row with this inference.
+        ticket = str(event.get("Ticket ID", "") or "").strip()
+        current_focus = str(event.get("Focus Area", "") or "").strip()
+        if not current_focus and ticket and ticket != "No Ticket ID" and df_main is not None:
+            if {"Ticket ID", "Focus Area"}.issubset(df_main.columns):
+                matching = df_main.loc[df_main["Ticket ID"].astype(str).str.strip() == ticket, "Focus Area"]
+                if not matching.empty and pd.notna(matching.iloc[0]):
+                    event["Focus Area"] = str(matching.iloc[0]).strip()
+        output.append(event)
+    return pd.DataFrame(output)
+
+
+def render_group_activity_section(df_interactions, key_prefix, df_deliveries=None, df_main=None):
+    """Team-wide group activity summary and report-ready export."""
+    st.markdown("### 👥 Group Activities (PLNs, Webinars, Office Hours & Workshops)")
+    st.caption("Logged by anyone on the team and visible to everyone; categorized by activity rather than meeting format.")
     grouped = group_interactions(df_interactions)
     if grouped is None or grouped.empty:
-        st.info("No PLNs, webinars or office hours have been logged yet.")
+        st.info("No group activities have been logged yet.")
         return
-
-    view = grouped.drop(
-        columns=[c for c in ["Submission Date"] if c in grouped.columns]
-    ).copy()
-
+    view = grouped.copy()
     if "Date of Interaction" in view.columns:
-        view["Date of Interaction"] = pd.to_datetime(
-            view["Date of Interaction"], errors="coerce"
-        )
-        view = view.sort_values("Date of Interaction", ascending=False)
-        recent_cut = pd.Timestamp(datetime.now().date() - timedelta(days=30))
-        recent_rows = view[view["Date of Interaction"] >= recent_cut]
-        view["Date of Interaction"] = view["Date of Interaction"].dt.strftime("%Y-%m-%d")
+        date_values = pd.to_datetime(view["Date of Interaction"], errors="coerce")
+        recent = view.loc[date_values >= pd.Timestamp(datetime.now().date() - timedelta(days=30))]
+        view = view.loc[date_values.sort_values(ascending=False, na_position="last").index]
     else:
-        recent_rows = view.iloc[0:0]
-
-    total_activities = _distinct_activity_count(view)
-    recent_activities = _distinct_activity_count(recent_rows)
-    jurisdictions_reached = (
-        int(view["Jurisdiction"].astype(str).str.strip().replace("", pd.NA).nunique())
-        if "Jurisdiction" in view.columns else 0
+        recent = view.iloc[0:0]
+    cols = st.columns(3)
+    cols[0].metric("Group activities", _distinct_activity_count(view))
+    cols[1].metric("Last 30 days", _distinct_activity_count(recent))
+    reached = view.get("Jurisdiction", pd.Series(dtype=str)).astype(str).str.strip().replace("", pd.NA).dropna().nunique()
+    cols[2].metric("Jurisdictions reached", int(reached))
+    available = sorted(view["TA / Activity Category"].fillna("").astype(str).unique())
+    available = [x for x in available if x.strip()]
+    selected = st.multiselect("Filter by TA / Activity Category", available, default=available, key=f"{key_prefix}_group_category_filter")
+    if selected:
+        view = view.loc[view["TA / Activity Category"].isin(selected)]
+    elif available:
+        view = view.iloc[0:0]
+    st.caption("Each row represents one jurisdiction; activity counts above count each event once.")
+    show_df(view.drop(columns=["Submission Date"], errors="ignore").reset_index(drop=True))
+    export = build_activity_report(view, df_main)
+    st.download_button(
+        "Download group activity summary (CSV)",
+        export.to_csv(index=False).encode("utf-8-sig"),
+        file_name="TA_Portal_group_activities.csv", mime="text/csv",
+        key=f"{key_prefix}_group_export",
     )
-
-    st.markdown(
-        f"""
-        <div style='background: #ede7f6; border-radius: 10px; padding: 1em; margin-bottom: 1em; text-align: center;'>
-            <div style='display: flex; justify-content: space-around;'>
-                <div>
-                    <div style='font-size: 1.5em; font-weight: bold; color: #4a148c;'>{total_activities}</div>
-                    <div style='font-size: 0.9em; color: #666;'>Group Activities</div>
-                </div>
-                <div>
-                    <div style='font-size: 1.5em; font-weight: bold; color: #388e3c;'>{recent_activities}</div>
-                    <div style='font-size: 0.9em; color: #666;'>Last 30 Days</div>
-                </div>
-                <div>
-                    <div style='font-size: 1.5em; font-weight: bold; color: #1976d2;'>{jurisdictions_reached}</div>
-                    <div style='font-size: 0.9em; color: #666;'>Jurisdictions Reached</div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    available_types = sorted(
-        t for t in view.get(
-            "Type of Interaction", pd.Series(dtype=str)
-        ).astype(str).str.strip().unique() if t and t.lower() != "nan"
-    )
-    chosen_types = st.multiselect(
-        "Filter by activity type",
-        available_types,
-        default=available_types,
-        key=f"{key_prefix}_group_type_filter",
-    )
-    if chosen_types:
-        view = view[view["Type of Interaction"].astype(str).str.strip().isin(chosen_types)]
-
-    st.caption(
-        "A multi-jurisdiction activity is stored as one row per jurisdiction, so the "
-        "table below can show several rows for a single event."
-    )
-    show_df(view.reset_index(drop=True))
-
-
+    with st.expander("📊 Portal reporting exports (replaces manual PLN totals)"):
+        all_activities = build_activity_report(df_interactions, df_main)
+        st.caption("Event-level data (one row per activity, not per jurisdiction); old PLN rows retain unknown meeting formats as blank.")
+        if not all_activities.empty:
+            category_counts = all_activities["TA / Activity Category"].replace("", "Unclassified (legacy)").value_counts()
+            show_df(category_counts.rename_axis("TA / Activity Category").reset_index(name="Unique activities"))
+        st.download_button(
+            "Download all portal interaction events (CSV)",
+            all_activities.to_csv(index=False).encode("utf-8-sig"),
+            file_name="TA_Portal_interaction_events.csv", mime="text/csv",
+            key=f"{key_prefix}_all_interaction_report",
+        )
+        if df_deliveries is not None and not df_deliveries.empty:
+            deliveries = df_deliveries.copy()
+            if "Type of Delivery" in deliveries.columns:
+                deliveries["Standardized Delivery Type"] = deliveries["Type of Delivery"].map(canonical_delivery_type)
+            st.download_button(
+                "Download deliveries with standardized categories (CSV)",
+                deliveries.to_csv(index=False).encode("utf-8-sig"),
+                file_name="TA_Portal_deliveries_standardized.csv", mime="text/csv",
+                key=f"{key_prefix}_delivery_report",
+            )
 
 
 # --- Federal mileage reimbursement ------------------------------------------------------
@@ -3850,7 +3970,10 @@ for _col in comment_history_columns:
 
 @st.cache_data(ttl=600)
 def load_interaction_sheet():
-    return pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'Interaction'))
+    # Read-only compatibility view; old raw "Type of Interaction" values are untouched.
+    return normalize_interaction_dataframe(
+        pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'Interaction'))
+    )
 
 df_int = load_interaction_sheet()
 
@@ -3876,7 +3999,8 @@ if "Entered By" not in df_del.columns:
 # Two rows are the same entry when every key field below matches. The Delivery sheet has
 # no Jurisdiction column (report.py joins it from Main), so its key can't include one.
 INTERACTION_DEDUP_KEYS = [
-    "Ticket ID", "Jurisdiction", "Date of Interaction", "Type of Interaction", "Short Summary",
+    "Ticket ID", "Jurisdiction", "Date of Interaction", "Type of Interaction",
+    "TA / Activity Category", "Short Summary", "Submitted By",
 ]
 DELIVERY_DEDUP_KEYS = [
     "Ticket ID", "Date of Delivery", "Type of Delivery", "Short Summary",
@@ -4748,12 +4872,7 @@ else:
             phone = st.text_input("Phone Number *",placeholder="(201) 555-0123", key="requester_phone")    
         col7, col8 = st.columns(2)
         with col7:
-            focus_area_options = [
-                "Housing", "Prevention", "Substance Abuse", "Rapid Start",
-                "Telehealth/Telemedicine", "Data Sharing","Evaluation","Implementation Science",
-                "Continuous Quality Improvement", "Sustainability", "Sub-recipient Monitoring",
-                "Procurement", "Work Plan and Budget", "Other"
-            ]
+            focus_area_options = TA_FOCUS_AREA_OPTIONS
 
             focus_area = st.selectbox(
                 "TA Focus Area *",
@@ -5581,7 +5700,7 @@ else:
                                 </div>
                             """, unsafe_allow_html=True)
 
-                        render_group_activity_section(df_int, "coord")
+                        render_group_activity_section(df_int, "coord", df_del, df)
 
                         # Middle section: View Interactions by Ticket ID
                         st.markdown("""
@@ -5647,12 +5766,8 @@ else:
                                 placeholder="Select option...", key='interaction_coord')
                         with col2:
                             date_int = st.date_input("Date of Interaction *", value=datetime.today().date())
-
-                        type_interaction = st.selectbox(
-                            "Type of Interaction *",
-                            INTERACTION_TYPES,
-                            index=None,
-                            placeholder="Select option..."
+                        type_interaction, activity_category, focus_area_interaction = render_interaction_classification(
+                            ticket_id_int, df, "coord_int"
                         )
 
                         # Jurisdiction scope is independent of the interaction type, so any
@@ -5688,11 +5803,7 @@ else:
                             )
 
 
-                        # If "Other" is selected, show a text input for custom value
-                        if type_interaction == "Other":
-                            type_interaction_other = st.text_input("Please specify the Type of Interaction *")
-                            if type_interaction_other:
-                                type_interaction = type_interaction_other 
+                        # Custom options are handled by render_interaction_classification.
                         
                         interaction_description = st.text_area("Short Summary *", placeholder='Enter text', height=150, key='interaction_description_coord') 
 
@@ -5728,7 +5839,10 @@ else:
                             if multi_juris and not pln_jurisdictions:
                                 errors.append("Select at least one jurisdiction, or switch to 'One jurisdiction'.")
                             if not date_int: errors.append("Date of interaction is required.")
-                            if not type_interaction: errors.append("Type of interaction is required.")
+                            if not type_interaction: errors.append("Interaction Type is required.")
+                            if not activity_category: errors.append("TA / Activity Category is required.")
+                            if ticket_id_int == "No Ticket ID" and not focus_area_interaction:
+                                errors.append("Focus Area is required when there is no Ticket ID.")
                             if not interaction_description: errors.append("Short summary is required.")
 
                             # Show warnings or success
@@ -5771,11 +5885,16 @@ else:
                                     else:
                                         jurisdiction_values = [jurisdiction_for_no_ticket or ""]
 
+                                activity_id_int = str(uuid.uuid4())  # shared across jurisdictions
                                 rows_int = [
                                     {
                                         'Ticket ID': ticket_id_int,
                                         "Date of Interaction": date_int.strftime("%Y-%m-%d"),
-                                        "Type of Interaction": type_interaction,
+                                        "Type of Interaction": type_interaction,  # legacy report compatibility
+                                        "Interaction Type": type_interaction,
+                                        "TA / Activity Category": activity_category,
+                                        "Focus Area": focus_area_interaction,
+                                        "Activity ID": activity_id_int,
                                         "Short Summary": interaction_description,
                                         "Document": drive_links_int,
                                         "Jurisdiction": juris,
@@ -5840,7 +5959,7 @@ else:
                             date_del = st.date_input("Date of Delivery *",value=datetime.today().date())
 
                         list_delivery = [
-                            "Report", "Email Reply", "Dashboard", "New Data Points", "Peer Learning Facilitation", "TA Meeting", "Other"
+                            "Report", "Email Reply", "Dashboard", "New Data Points", "Peer to peer knowledge sharing", "TA Meeting", "Other"
                         ]
 
                         type_delivery = st.selectbox(
@@ -6446,7 +6565,11 @@ GU-TAP System
                             
                             # Every travel form and where it stands (rejected ones included), newest first.
                             st.markdown("---")
-                            st.markdown("#### 📋 All travel forms — status")
+                            st.markdown("#### 📋 All travel forms — status (newest first)")
+                            st.caption(
+                                "A form rejected by one approver is closed and leaves everyone's queue. "
+                                "It stays here with who rejected it and why, so nothing just 'disappears'."
+                            )
                             render_status_table(
                                 build_travel_status_table(df_travel_review),
                                 key="coord_travel_status",
@@ -7120,7 +7243,11 @@ GU-TAP System
                             st.error(f"Error loading GSA exemption forms: {str(e)}")
                         # --- Every GSA exemption and where it stands, newest first ---
                         st.markdown("---")
-                        st.markdown("#### 📋 All GSA exemption forms — status")
+                        st.markdown("#### 📋 All GSA exemption forms — status (newest first)")
+                        st.caption(
+                            "A form rejected by one approver is closed for both. "
+                            "It stays here with who rejected it and why."
+                        )
                         try:
                             render_status_table(
                                 build_gsa_status_table(load_gsa_exemption_sheet()),
@@ -7468,7 +7595,7 @@ GU-TAP System
                             </div>
                         """, unsafe_allow_html=True)
 
-                    render_group_activity_section(df_int, "staff")
+                    render_group_activity_section(df_int, "staff", df_del, df)
 
                     # Middle section: View Interactions by Ticket ID
                     st.markdown("""
@@ -7535,12 +7662,8 @@ GU-TAP System
                             placeholder="Select option...", key='interaction1')
                     with col2:
                         date_int = st.date_input("Date of Interaction *", value=datetime.today().date())
-                    
-                    type_interaction = st.selectbox(
-                        "Type of Interaction *",
-                        INTERACTION_TYPES,
-                        index=None,
-                        placeholder="Select option..."
+                    type_interaction, activity_category, focus_area_interaction = render_interaction_classification(
+                        ticket_id_int, df, "staff_int"
                     )
 
                     # Jurisdiction scope is independent of the interaction type: any activity
@@ -7564,7 +7687,7 @@ GU-TAP System
                             lis_location,
                             default=[],
                             placeholder="Select one or more...",
-                            key='juris_pln_coord'
+                            key='juris_pln_staff'
                         )
                     elif ticket_id_int == "No Ticket ID":
                         jurisdiction_for_no_ticket = st.selectbox(
@@ -7572,14 +7695,10 @@ GU-TAP System
                             lis_location,
                             index=None,
                             placeholder="Select option...",
-                            key='juris_interaction_coord'
+                            key='juris_interaction_staff'
                         )
 
-                    # If "Other" is selected, show a text input for custom value
-                    if type_interaction == "Other":
-                        type_interaction_other = st.text_input("Please specify the Type of Interaction *")
-                        if type_interaction_other:
-                            type_interaction = type_interaction_other
+                    # Custom options are handled by render_interaction_classification.
 
                     interaction_description = st.text_area("Short Summary *", placeholder='Enter text',
                         height=150, key='interaction_description_coord')
@@ -7631,7 +7750,10 @@ GU-TAP System
                         if multi_juris and not pln_jurisdictions:
                             errors.append("Select at least one jurisdiction, or switch to 'One jurisdiction'.")
                         if not date_int: errors.append("Date of interaction is required.")
-                        if not type_interaction: errors.append("Type of interaction is required.")
+                        if not type_interaction: errors.append("Interaction Type is required.")
+                        if not activity_category: errors.append("TA / Activity Category is required.")
+                        if ticket_id_int == "No Ticket ID" and not focus_area_interaction:
+                            errors.append("Focus Area is required when there is no Ticket ID.")
                         if not interaction_description: errors.append("Short summary is required.")
 
                         # Show warnings or success
@@ -7674,11 +7796,16 @@ GU-TAP System
                                 else:
                                     jurisdiction_values = [jurisdiction_for_no_ticket or ""]
 
+                            activity_id_int = str(uuid.uuid4())  # shared across jurisdictions
                             rows_int = [
                                 {
                                     'Ticket ID': ticket_id_int,
                                     "Date of Interaction": date_int.strftime("%Y-%m-%d"),  # Convert to string
-                                    "Type of Interaction": type_interaction,
+                                    "Type of Interaction": type_interaction,  # legacy report compatibility
+                                    "Interaction Type": type_interaction,
+                                    "TA / Activity Category": activity_category,
+                                    "Focus Area": focus_area_interaction,
+                                    "Activity ID": activity_id_int,
                                     "Short Summary": interaction_description,
                                     "Document": drive_links_int,
                                     "Jurisdiction": juris,
@@ -9097,7 +9224,7 @@ GU-TAP System
                         date_del = st.date_input("Date of Delivery *",value=datetime.today().date())
 
                     list_delivery = [
-                        "Report", "Email Reply", "Dashboard", "New Data Points","Peer Learning Facilitation", "TA Meeting", "Other"
+                        "Report", "Email Reply", "Dashboard", "New Data Points","Peer to peer knowledge sharing", "TA Meeting", "Other"
                     ]
 
                     type_delivery = st.selectbox(
@@ -10377,7 +10504,9 @@ GU-TAP System
                     ra_provider_names = sorted({
                         str(roles["Assignee/Staff"]["name"]).strip()
                         for roles in USERS.values()
-                        if "Assignee/Staff" in roles and str(roles["Assignee/Staff"].get("name", "")).strip()
+                        if "Assignee/Staff" in roles
+                        and str(roles["Assignee/Staff"].get("name", "")).strip()
+                        and str(roles["Assignee/Staff"]["name"]).strip().casefold() != "katherine robsky"
                     })
 
                     ra_provider = st.selectbox(
@@ -10419,10 +10548,8 @@ GU-TAP System
                                     key="ra_int_date",
                                 )
 
-                            ra_type_int = st.selectbox(
-                                "Type of Interaction *",
-                                INTERACTION_TYPES,
-                                index=None, placeholder="Select option...", key="ra_int_type",
+                            ra_type_int, ra_activity_category, ra_focus_area = render_interaction_classification(
+                                ra_ticket_int, df, "ra_int"
                             )
 
                             # Scope is independent of type; defaults to one jurisdiction.
@@ -10447,13 +10574,6 @@ GU-TAP System
                                     placeholder="Select option...", key="ra_int_juris",
                                 )
 
-                            if ra_type_int == "Other":
-                                ra_type_int_other = st.text_input(
-                                    "Please specify the Type of Interaction *", key="ra_int_type_other",
-                                )
-                                if ra_type_int_other:
-                                    ra_type_int = ra_type_int_other
-
                             ra_summary_int = st.text_area(
                                 "Short Summary *", placeholder="Enter text", height=150,
                                 key="ra_int_summary",
@@ -10467,11 +10587,15 @@ GU-TAP System
                                 if not ra_ticket_int:
                                     ra_missing.append("Ticket ID")
                                 if not ra_type_int:
-                                    ra_missing.append("Type of Interaction")
+                                    ra_missing.append("Interaction Type")
+                                if not ra_activity_category:
+                                    ra_missing.append("TA / Activity Category")
+                                if ra_ticket_int == "No Ticket ID" and not ra_focus_area:
+                                    ra_missing.append("Focus Area")
                                 if not ra_summary_int or not ra_summary_int.strip():
                                     ra_missing.append("Short Summary")
                                 if ra_is_pln and not ra_pln_juris:
-                                    ra_missing.append("Jurisdiction(s) for PLN")
+                                    ra_missing.append("Jurisdiction(s) for multiple-jurisdiction activity")
                                 if (not ra_is_pln) and ra_ticket_int == "No Ticket ID" and not ra_juris_no_ticket:
                                     ra_missing.append("Jurisdiction")
 
@@ -10507,11 +10631,16 @@ GU-TAP System
                                         else:
                                             ra_juris_values = [ra_juris_no_ticket or ""]
 
+                                    ra_activity_id = str(uuid.uuid4())  # one event, many jurisdictions
                                     ra_rows_int = [
                                         {
                                             "Ticket ID": ra_ticket_int,
                                             "Date of Interaction": ra_date_int.strftime("%Y-%m-%d"),
-                                            "Type of Interaction": ra_type_int,
+                                            "Type of Interaction": ra_type_int,  # legacy report compatibility
+                                            "Interaction Type": ra_type_int,
+                                            "TA / Activity Category": ra_activity_category,
+                                            "Focus Area": ra_focus_area,
+                                            "Activity ID": ra_activity_id,
                                             "Short Summary": ra_summary_int,
                                             "Document": ra_links_int,
                                             "Jurisdiction": ra_juris,
@@ -10567,7 +10696,7 @@ GU-TAP System
                             ra_type_del = st.selectbox(
                                 "Type of Delivery *",
                                 ["Report", "Email Reply", "Dashboard", "New Data Points",
-                                 "Peer Learning Facilitation", "TA Meeting", "Other"],
+                                 "Peer to peer knowledge sharing", "TA Meeting", "Other"],
                                 index=None, placeholder="Select option...", key="ra_del_type",
                             )
                             if ra_type_del == "Other":
