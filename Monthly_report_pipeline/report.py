@@ -477,39 +477,154 @@ def normalize_main(df_main: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def normalize_interactions(df_inter: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expected columns in your sheet:
-    Ticket ID, Jurisdiction, Date of Interaction, Type of Interaction, Short Summary, Document, Submission Date, Submitted By
-    """
-    df = df_inter.copy()
-    if "Ticket ID" not in df.columns:
-        return pd.DataFrame(columns=["Ticket ID"])
+# New portal columns are authoritative. Historical records are classified using
+# Type of Interaction without assigning a channel or category not actually logged.
+INTERACTION_CATEGORY_PLN = "Peer Learning Network Meeting (PLN)"
+INTERACTION_CATEGORY_ITA = "Intensive Technical Assistance Workshop"
+LEGACY_TA_CATEGORIES = {
+    "peer learning meetings (plns)": INTERACTION_CATEGORY_PLN,
+    "peer learning network meeting (pln)": INTERACTION_CATEGORY_PLN,
+    "webinars": "Webinar",
+    "webinar": "Webinar",
+    "office hours": "Office Hours",
+    "intensive technical assistance workshop": INTERACTION_CATEGORY_ITA,
+}
+LEGACY_CHANNELS = {
+    "email": "E-mail",
+    "e-mail": "E-mail",
+    "phone call": "Phone Call",
+    "online meeting": "Online Meeting (Virtual)",
+    "online meeting (virtual)": "Online Meeting (Virtual)",
+    "in-person meeting": "In-Person Meeting",
+    "document or material sharing": "Document or Material Sharing",
+    "other": "Other",
+}
 
-    # Parse dates if present
+
+def clean_cell(value: Any) -> str:
+    if value is None or (isinstance(value, (float, np.floating)) and pd.isna(value)):
+        return ""
+    out = re.sub(r"\s+", " ", str(value)).strip()
+    return "" if out.casefold() in {"nan", "nat", "none", "null"} else out
+
+
+def normalize_interactions(df_inter: pd.DataFrame) -> pd.DataFrame:
+    """Backwards-compatible read of the original and three new Interaction columns."""
+    df = df_inter.copy()
+    for c in ["Ticket ID", "Jurisdiction", "Date of Interaction", "Type of Interaction",
+              "Interaction Type", "TA / Activity Category", "Focus Area", "Short Summary",
+              "Document", "Submitted By"]:
+        if c not in df.columns:
+            df[c] = ""
     for c in ["Date of Interaction", "Submission Date"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
-
-    # Redact submitted by (privacy)
-    if "Submitted By" in df.columns:
-        df["Submitted By"] = "[redacted]"
-
-    # Make sure strings are strings
-    for c in ["Type of Interaction", "Short Summary", "Document"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str)
-
-    # Same canonicalization as the main sheet
+    for c in ["Ticket ID", "Jurisdiction", "Type of Interaction", "Interaction Type",
+              "TA / Activity Category", "Focus Area", "Short Summary", "Document", "Submitted By"]:
+        df[c] = df[c].map(clean_cell)
+    # Keep the real submitter only for in-memory session grouping; never export it.
+    df["_session_submitter"] = df["Submitted By"]
+    old_key = df["Type of Interaction"].str.casefold()
+    new_channel = df["Interaction Type"]
+    new_cat = df["TA / Activity Category"]
+    fallback_channel = old_key.map(LEGACY_CHANNELS).fillna("")
+    fallback_category = old_key.map(LEGACY_TA_CATEGORIES).fillna("")
+    # Where no legacy group category is known, leave the category explicitly unclassified.
+    df["Interaction Type (Resolved)"] = new_channel.where(new_channel.ne(""), fallback_channel)
+    df["TA / Activity Category (Resolved)"] = new_cat.where(new_cat.ne(""), fallback_category)
+    df["TA / Activity Category (Resolved)"] = df["TA / Activity Category (Resolved)"].replace("", "Unclassified")
+    df.loc[df["TA / Activity Category (Resolved)"].str.casefold().isin({
+        "peer learning meetings (plns)", "peer learning network meeting (pln)",
+    }), "TA / Activity Category (Resolved)"] = INTERACTION_CATEGORY_PLN
+    df["Interaction Month"] = df["Date of Interaction"].dt.strftime("%Y-%m")
+    df.loc[df["Date of Interaction"].isna(), "Interaction Month"] = ""
     if "Jurisdiction" in df.columns:
         df["Jurisdiction"] = canonicalize_jurisdiction(df["Jurisdiction"])
         df["Jurisdiction (Standardized)"] = standardize_jurisdiction_series(df["Jurisdiction"])
-    else:
-        df["Jurisdiction"] = "Unknown"
-        df["Jurisdiction (Standardized)"] = "Unknown"
-
+    df["Submitted By"] = "[redacted]"
     return df
 
+
+def add_interaction_focus(df_inter: pd.DataFrame, df_main: pd.DataFrame) -> pd.DataFrame:
+    """Use the interaction's focus first; fall back to its ticket's focus, if available."""
+    df = df_inter.copy()
+    if df.empty:
+        df["Focus Area (Resolved)"] = pd.Series(dtype=str)
+        return df
+    focus_by_ticket = dict(zip(
+        df_main["Ticket ID"].map(clean_cell), df_main["Focus Area"].map(clean_cell)
+    )) if "Ticket ID" in df_main.columns and "Focus Area" in df_main.columns else {}
+    own = df["Focus Area"].map(clean_cell)
+    related = df["Ticket ID"].map(clean_cell).map(focus_by_ticket).fillna("")
+    df["Focus Area (Resolved)"] = own.where(own.ne(""), related)
+    return df
+
+
+def is_pln_session(row: pd.Series) -> bool:
+    """Session count excludes email scheduling/follow-up and material sharing.
+
+    New portal records have a recorded meeting channel. For old PLN-coded
+    entries without a channel, use positive evidence of a held meeting.
+    Ambiguous legacy activities remain in Interaction metrics, not session KPIs.
+    """
+    if clean_cell(row.get("TA / Activity Category (Resolved)")).casefold() != INTERACTION_CATEGORY_PLN.casefold():
+        return False
+    channel = clean_cell(row.get("Interaction Type (Resolved)")).casefold()
+    if channel:
+        return channel in {"online meeting (virtual)", "online meeting", "in-person meeting"}
+    summary = clean_cell(row.get("Short Summary")).casefold()
+    if not summary:
+        return False
+    if re.match(r"^(sent|sending|follow[- ]?up|confirmation|confirmed|schedule|scheduled|planning|agenda|shared)", summary):
+        return False
+    return bool(re.search(
+        r"\b(facilitated|held|conducted|hosted|attended|participated in|joined|convened)\b.*"
+        r"\b(meeting|session|call|peer learning|pln)\b",
+        summary,
+    ))
+
+
+def portal_pln_sessions(df_inter: pd.DataFrame) -> list[dict[str, Any]]:
+    """One PLN session per dated event; jurisdiction rows are combined, never summed."""
+    if df_inter.empty:
+        return []
+    mask = df_inter.apply(is_pln_session, axis=1)
+    plns = df_inter.loc[mask].copy()
+    buckets: dict[tuple, dict[str, Any]] = {}
+    for pos, (_, row) in enumerate(plns.iterrows()):
+        date = pd.to_datetime(row.get("Date of Interaction"), errors="coerce")
+        date_str = date.strftime("%Y-%m-%d") if pd.notna(date) else ""
+        summary = clean_cell(row.get("Short Summary"))
+        # Without a date or summary, joining unrelated rows into one session would be unsafe.
+        submitter = clean_cell(row.get("_session_submitter")).casefold()
+        key = (date_str, summary.casefold(), submitter) if date_str and summary else ("unique", pos)
+        if key not in buckets:
+            buckets[key] = {
+                "id": None, "date": date_str, "month": date_str[:7],
+                "location": clean_cell(row.get("Interaction Type (Resolved)")),
+                "status": "Completed", "focus_area": "", "notes": summary,
+                "jurisdictions": [], "jurisdiction_count": 0, "complete": True,
+                "ticket_ids": [],
+            }
+        event = buckets[key]
+        jur = clean_cell(row.get("Jurisdiction (Standardized)"))
+        if jur and jur.casefold() not in JURISDICTION_BLANKS and jur != "Unknown" and jur not in event["jurisdictions"]:
+            event["jurisdictions"].append(jur)
+        focus = clean_cell(row.get("Focus Area (Resolved)"))
+        if focus and focus not in event.get("_focuses", []):
+            event.setdefault("_focuses", []).append(focus)
+        ticket = clean_cell(row.get("Ticket ID"))
+        if ticket and ticket.casefold() != "no ticket id" and ticket not in event["ticket_ids"]:
+            event["ticket_ids"].append(ticket)
+        if not event["location"]:
+            event["location"] = clean_cell(row.get("Interaction Type (Resolved)"))
+    events = sorted(buckets.values(), key=lambda e: (e["date"], e["notes"]), reverse=True)
+    for i, event in enumerate(events, 1):
+        event["id"] = i
+        event["jurisdictions"].sort()
+        event["jurisdiction_count"] = len(event["jurisdictions"])
+        event["focus_area"] = "; ".join(event.pop("_focuses", [])) or "Topic not recorded"
+    return events
 
 def normalize_deliveries(df_del: pd.DataFrame) -> pd.DataFrame:
     """
@@ -595,7 +710,7 @@ def read_extra_activities(xlsx_path: str | None) -> dict[str, pd.DataFrame]:
     }
     if not xlsx_path or not os.path.exists(xlsx_path):
         if xlsx_path:
-            print(f"! Additional TA activities workbook not found ({xlsx_path}); ITA/PLN panels will be empty.", file=sys.stderr)
+            print(f"i Optional historical Intensives workbook not found ({xlsx_path}); ITA panel will be empty.", file=sys.stderr)
         return empty
 
     try:
@@ -659,32 +774,15 @@ def compute_payload(
     id_col: str = "Ticket ID",
 ) -> dict[str, Any]:
 
-    # Counts from Interaction & Delivery sheets
-    # For interactions: count by Ticket ID, but also include interactions without Ticket ID (they have Jurisdiction)
+    df_inter = add_interaction_focus(df_inter, df_main)
+    # Preserve raw interaction rows for ticket and jurisdiction counts; PLN events are
+    # deduplicated independently for session-level reporting.
     inter_counts = (
-        df_inter.groupby(id_col).size().reset_index(name="interactions_count")
-        if id_col in df_inter.columns and not df_inter.empty else pd.DataFrame(columns=[id_col, "interactions_count"])
+        df_inter.loc[~df_inter[id_col].map(clean_cell).str.casefold().isin({"", "no ticket id"})]
+        .groupby(id_col).size().reset_index(name="interactions_count")
+        if id_col in df_inter.columns and not df_inter.empty
+        else pd.DataFrame(columns=[id_col, "interactions_count"])
     )
-    
-    # Count interactions without Ticket ID but with Jurisdiction - these should be counted as general interactions
-    # Try to assign them to months based on Date of Interaction if available
-    inter_without_ticket = 0
-    inter_without_ticket_by_month = {}
-    if not df_inter.empty and id_col in df_inter.columns:
-        # Check for interactions where Ticket ID is null/na but Jurisdiction exists
-        if "Jurisdiction" in df_inter.columns:
-            inter_no_ticket = df_inter[
-                (df_inter[id_col].astype(str).str.strip() == "No Ticket ID")
-            ]
-            inter_without_ticket = len(inter_no_ticket)
-            
-            # If Date of Interaction exists, assign to months
-            if "Date of Interaction" in inter_no_ticket.columns and inter_without_ticket > 0:
-                inter_no_ticket = inter_no_ticket.copy()
-                inter_no_ticket["Date of Interaction"] = pd.to_datetime(inter_no_ticket["Date of Interaction"], errors="coerce")
-                inter_no_ticket["Interaction Month"] = inter_no_ticket["Date of Interaction"].dt.to_period("M").astype(str)
-                inter_without_ticket_by_month = inter_no_ticket.groupby("Interaction Month").size().to_dict()
-    
     # Count deliveries per ticket ID (for ticket-level display)
     del_counts = (
         df_del.groupby(id_col).size().reset_index(name="deliveries_count")
@@ -725,73 +823,35 @@ def compute_payload(
     df["interactions_count"] = df["interactions_count"].fillna(0).astype(int)
     df["deliveries_count"] = df["deliveries_count"].fillna(0).astype(int)
 
-    # Count deliveries by delivery month (not by TA request submit month)
-    # Get all unique months from both Submit Month and Delivery Month
-    submit_months = set(df["Submit Month"].dropna().unique())
-    delivery_months = set()
-    if not df_del.empty and "Delivery Month" in df_del.columns:
-        delivery_months = set(df_del["Delivery Month"].dropna().unique())
-    all_months = sorted(list(submit_months | delivery_months))
+    # Monthly interactions are dated by the interaction itself, including no-ticket records.
+    submit_months = set(df["Submit Month"].dropna().loc[lambda x: x.ne("NaT")])
+    delivery_months = set(df_del["Delivery Month"].dropna().loc[lambda x: x.ne("NaT")]) if "Delivery Month" in df_del.columns else set()
+    interaction_months = set(df_inter["Interaction Month"].dropna().loc[lambda x: x.ne("")]) if "Interaction Month" in df_inter.columns else set()
+    all_months = sorted(submit_months | delivery_months | interaction_months)
 
-    # Monthly KPIs (overall; filters are done in JS)
-    # Group by Submit Month for tickets
-    monthly_submit = (
-        df.groupby("Submit Month", dropna=False)
-          .agg(
-              submitted=(id_col, "count"),
-              completed=("Close Date", lambda s: int(pd.to_datetime(s, errors="coerce").notna().sum()) if "Close Date" in df.columns else 0),
-              avg_days_to_assign=("Days to Assign", safe_nanmean),
-              avg_days_to_close=("Days to Close", safe_nanmean),
-              interactions=("interactions_count", "sum"),
-          )
-          .reset_index()
-    )
-
-    # Count deliveries by Delivery Month
+    monthly_submit = df.groupby("Submit Month", dropna=False).agg(
+        submitted=(id_col, "count"),
+        completed=("Close Date", lambda s: int(pd.to_datetime(s, errors="coerce").notna().sum())),
+        avg_days_to_assign=("Days to Assign", safe_nanmean),
+        avg_days_to_close=("Days to Close", safe_nanmean),
+    ).reset_index()
     monthly_deliveries = (
-        df_del.groupby("Delivery Month", dropna=False).size().reset_index(name="deliveries")
-        if "Delivery Month" in df_del.columns and not df_del.empty
-        else pd.DataFrame(columns=["Delivery Month", "deliveries"])
+        df_del.groupby("Delivery Month").size().reset_index(name="deliveries")
+        if "Delivery Month" in df_del.columns else pd.DataFrame(columns=["Delivery Month", "deliveries"])
     )
-
-    # Merge monthly data, ensuring all months are included
+    monthly_interactions = (
+        df_inter.loc[df_inter["Interaction Month"].ne("")].groupby("Interaction Month").size().reset_index(name="interactions")
+        if "Interaction Month" in df_inter.columns else pd.DataFrame(columns=["Interaction Month", "interactions"])
+    )
     monthly = pd.DataFrame({"Submit Month": all_months})
     monthly = monthly.merge(monthly_submit, on="Submit Month", how="left")
     monthly = monthly.merge(monthly_deliveries.rename(columns={"Delivery Month": "Submit Month"}), on="Submit Month", how="left")
-    
-    # Fill NaN values
-    monthly["submitted"] = monthly["submitted"].fillna(0).astype(int)
-    monthly["completed"] = monthly["completed"].fillna(0).astype(int)
-    monthly["interactions"] = monthly["interactions"].fillna(0).astype(int)
-    monthly["deliveries"] = monthly["deliveries"].fillna(0).astype(int)
-    monthly["avg_days_to_assign"] = monthly["avg_days_to_assign"]
-    monthly["avg_days_to_close"] = monthly["avg_days_to_close"]
+    monthly = monthly.merge(monthly_interactions.rename(columns={"Interaction Month": "Submit Month"}), on="Submit Month", how="left")
+    for c in ("submitted", "completed", "interactions", "deliveries"):
+        monthly[c] = monthly[c].fillna(0).astype(int)
     monthly["completion_rate"] = np.where(
-        monthly["submitted"] > 0,
-        monthly["completed"] / monthly["submitted"],
-        np.nan,
+        monthly["submitted"] > 0, monthly["completed"] / monthly["submitted"], np.nan
     )
-    
-    # Add interactions without Ticket ID to monthly totals based on their interaction date
-    if inter_without_ticket_by_month:
-        for month, count in inter_without_ticket_by_month.items():
-            if month in monthly["Submit Month"].values:
-                monthly.loc[monthly["Submit Month"] == month, "interactions"] = (
-                    monthly.loc[monthly["Submit Month"] == month, "interactions"].values[0] + count
-                )
-            else:
-                # If month doesn't exist in monthly, add a new row
-                monthly = pd.concat([
-                    monthly,
-                    pd.DataFrame([{
-                        "Submit Month": month,
-                        "submitted": 0,
-                        "completed": 0,
-                        "interactions": count,
-                        "deliveries": 0,
-                        "completion_rate": np.nan
-                    }])
-                ], ignore_index=True)
 
     # Backlog at EOM (overall)
     months = sorted([m for m in df["Submit Month"].dropna().unique()])
@@ -847,7 +907,7 @@ def compute_payload(
     
     # Calculate summary statistics
     total_tickets = len(df)
-    total_interactions = int(df["interactions_count"].sum() + inter_without_ticket)
+    total_interactions = int(len(df_inter))
     # Count total deliveries from delivery dataframe (not from ticket-based counts)
     total_deliveries = len(df_del) if not df_del.empty else 0
     
@@ -861,7 +921,12 @@ def compute_payload(
 
     # Drilldown records: interactions + deliveries keyed by Ticket ID
     # Keep only minimal safe fields
-    inter_keep = [c for c in ["Ticket ID", "Jurisdiction", "Jurisdiction (Standardized)", "Date of Interaction", "Type of Interaction", "Short Summary", "Document"] if c in df_inter.columns]
+    inter_keep = [c for c in [
+        "Ticket ID", "Jurisdiction", "Jurisdiction (Standardized)", "Date of Interaction",
+        "Type of Interaction", "Interaction Type", "TA / Activity Category", "Focus Area",
+        "Interaction Type (Resolved)", "TA / Activity Category (Resolved)",
+        "Focus Area (Resolved)", "Short Summary", "Document",
+    ] if c in df_inter.columns]
     del_keep = [c for c in ["Ticket ID", "Jurisdiction (Standardized)", "Date of Delivery", "Delivery Month", "Type of Delivery", "Short Summary", "Document"] if c in df_del.columns]
 
     inter_rec = df_inter[inter_keep].copy() if inter_keep else pd.DataFrame(columns=["Ticket ID"])
@@ -884,10 +949,10 @@ def compute_payload(
     if "Date of Delivery" in del_rec.columns:
         del_rec["Date of Delivery"] = pd.to_datetime(del_rec["Date of Delivery"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    # ---- ITAs and PLNs -------------------------------------------------
+    # ---- Historical ITAs and confirmed portal PLN sessions -------------
     spelling_map = {j.casefold(): j for j in engaged_jurisdictions}
     ita_records = activity_records(df_ita, spelling_map) if df_ita is not None and not df_ita.empty else []
-    pln_records = activity_records(df_pln, spelling_map) if df_pln is not None and not df_pln.empty else []
+    pln_records = portal_pln_sessions(df_inter)
 
     # Jurisdictions that only appear via an ITA/PLN still deserve a filter entry.
     activity_jurs = set()
@@ -912,7 +977,7 @@ def compute_payload(
             "total_interactions": total_interactions,
             "total_deliveries": total_deliveries,
             "total_jurisdictions": total_jurisdictions,
-            # Metrics count delivered sessions only; scheduled ones still show in the tables.
+            # All portal-recorded PLN sessions are completed; optional legacy ITAs may be scheduled.
             "total_itas": sum(1 for r in ita_records if r["complete"]),
             "total_plns": sum(1 for r in pln_records if r["complete"]),
             "scheduled_itas": sum(1 for r in ita_records if not r["complete"]),
@@ -1169,7 +1234,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     .plnTopics .actHead { margin-bottom: 10px; }
     .plnTopics tr.total td { font-weight: 600; border-top: 2px solid var(--border); }
     .activity2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
-    @media (min-width: 1120px) { .activity2 { grid-template-columns: 1fr 1fr; } }
+    .interaction3 { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    @media (min-width: 750px) { .interaction3 { grid-template-columns: 1fr 1fr; } }
+    @media (min-width: 1120px) { .activity2 { grid-template-columns: 1fr 1fr; } .interaction3 { grid-template-columns: repeat(3, minmax(0,1fr)); } }
     .emptyMsg { padding: 18px; text-align: center; color: var(--ink-3); font-size: 12.5px; }
   </style>
 </head>
@@ -1246,6 +1313,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <span class="lead">Jump to</span>
         <a class="navlink" href="#secJurisdictions" style="--nav-accent: var(--s1);"><span class="dot"></span>Jurisdictions</a>
         <a class="navlink" href="#secTickets" style="--nav-accent: var(--s3);"><span class="dot"></span>Tickets</a>
+        <a class="navlink" href="#interactionSection" style="--nav-accent: var(--s1);"><span class="dot"></span>Interactions</a>
         <a class="navlink" href="#activitySection" style="--nav-accent: var(--s4);"><span class="dot"></span>ITAs &amp; PLNs</a>
       </div>
     </div>
@@ -1297,7 +1365,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="tfiltered" id="fltITA" style="display:none;"></div>
     </div>
     <div class="tcard clickable" id="cardPLN" style="--accent: var(--c-pln);" title="Click to see every PLN">
-      <div class="tlabel">PLNs</div>
+      <div class="tlabel">PLN sessions</div>
       <div class="tvalue" id="totPLN">&mdash;</div>
       <div class="ttotal">Peer learning sessions completed</div>
       <div class="tfiltered" id="fltPLN" style="display:none;"></div>
@@ -1428,12 +1496,50 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- ============ INTERACTION OVERVIEW ============ -->
+  <div class="eyebrow" id="interactionSection">TA interactions</div>
+  <div class="card">
+    <div class="sectionHead"><h2 class="section">Interaction and activity breakdown</h2>
+      <span class="pill" id="interactionBreakdownMeta">&mdash;</span></div>
+    <div class="interaction3">
+      <div>
+        <div class="actHead" style="border-left:4px solid var(--s1);">
+          <div class="name">TA / Activity Category</div>
+        </div>
+        <div class="tableWrap short"><table>
+          <thead><tr><th>TA / Activity Category</th><th class="num">Interactions</th></tr></thead>
+          <tbody id="interactionCategoryTbody"></tbody>
+        </table></div>
+      </div>
+      <div>
+        <div class="actHead" style="border-left:4px solid var(--s3);">
+          <div class="name">Interaction Type</div>
+        </div>
+        <div class="tableWrap short"><table>
+          <thead><tr><th>Interaction Type</th><th class="num">Interactions</th></tr></thead>
+          <tbody id="interactionChannelTbody"></tbody>
+        </table></div>
+      </div>
+      <div>
+        <div class="actHead" style="border-left:4px solid var(--s2);">
+          <div class="name">Focus Area</div>
+        </div>
+        <div class="tableWrap short"><table>
+          <thead><tr><th>Focus Area</th><th class="num">Interactions</th></tr></thead>
+          <tbody id="interactionFocusTbody"></tbody>
+        </table></div>
+      </div>
+    </div>
+    <p class="subnote">Historical activities without a recorded TA category appear as Unclassified; unknown meeting formats appear as Not recorded. Focus Area uses the interaction value, or its linked ticket when available.</p>
+  </div>
+
   <!-- ============ ITA / PLN ============ -->
   <div class="eyebrow" id="activitySection">Intensive TAs &amp; Peer Learning Networks</div>
   <div class="card">
     <div class="sectionHead">
       <h2 class="section">ITA &amp; PLN sessions</h2>
     </div>
+    <p class="subnote">PLN session totals exclude emails, scheduling and follow-up interactions. Historical sessions are identified from meeting descriptions; other PLN-related records remain under TA interactions.</p>
 
     <div class="activity2">
       <div>
@@ -1727,8 +1833,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (!f.q) return true;
       const tid = String(x["Ticket ID"] || "").trim();
       if (ids && ids.has(tid)) return true;
-      return blobHas([tid, x["Type of Interaction"], x["Short Summary"], x["Document"],
-                      x["Jurisdiction"], x[JUR]], f.q);
+      return blobHas([tid, x["Type of Interaction"], x["Interaction Type (Resolved)"],
+                      x["TA / Activity Category (Resolved)"], x["Focus Area (Resolved)"],
+                      x["Short Summary"], x["Document"], x["Jurisdiction"], x[JUR]], f.q);
     }
     function deliveryMatchesSearch(x, f, ids){
       if (!f.q) return true;
@@ -1738,7 +1845,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     function activityMatchesSearch(a, f){
       if (!f.q) return true;
-      return blobHas([a.id, a.location, a.focus_area, a.status, (a.jurisdictions || []).join(" ")], f.q);
+      return blobHas([a.id, a.location, a.focus_area, a.notes, a.status,
+                      (a.ticket_ids || []).join(" "), (a.jurisdictions || []).join(" ")], f.q);
     }
 
     function ticketsJurOnly(f){
@@ -1934,7 +2042,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       });
       const deliv = (PAYLOAD.deliveries || []).filter(x => String(x["Ticket ID"] || "").trim() === tid);
 
-      const interHtml = recordCards(inter, "Date of Interaction", "Type of Interaction",
+      const interHtml = recordCards(inter, "Date of Interaction", "Interaction Type (Resolved)",
                                     "No interaction records found for this ticket.");
       const delHtml = recordCards(deliv, "Date of Delivery", "Type of Delivery",
                                   "No delivery records found for this ticket.");
@@ -2106,6 +2214,10 @@ HTML_TEMPLATE = r"""<!doctype html>
           '<div class="recHead">' +
             '<span class="recDate">' + esc(x[dateKey] || "—") + '</span>' +
             (x[typeKey] ? '<span class="recTag">' + esc(x[typeKey]) + '</span>' : "") +
+            (dateKey === "Date of Interaction" && x["TA / Activity Category (Resolved)"]
+              ? '<span class="recTag">' + esc(x["TA / Activity Category (Resolved)"]) + '</span>' : "") +
+            (dateKey === "Date of Interaction" && x["Focus Area (Resolved)"]
+              ? '<span class="recTag">Focus: ' + esc(x["Focus Area (Resolved)"]) + '</span>' : "") +
             (showTicket ? '<span class="recTag">' + esc(tid) + '</span>' : "") +
             (noTicket ? '<span class="recTag">No ticket ID</span>' : "") +
             (opts.showJurisdiction && x[JUR] ? '<span class="recTag">' + esc(x[JUR]) + '</span>' : "") +
@@ -2139,7 +2251,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           (noTicket ? '<span class="pill"><b>Without a ticket ID:</b> ' + esc(noTicket) + '</span>' : "") +
         '</div>' +
         recSection("Interactions", inter.length) +
-        recordCards(inter, "Date of Interaction", "Type of Interaction",
+        recordCards(inter, "Date of Interaction", "Interaction Type (Resolved)",
                     "No interactions in this selection.", { showTicket: true }) +
         recSection("Deliveries", deliv.length) +
         recordCards(deliv, "Date of Delivery", "Type of Delivery",
@@ -2152,6 +2264,34 @@ HTML_TEMPLATE = r"""<!doctype html>
       jurDetailBody.innerHTML = "<div class='muted'>Click a jurisdiction row to list its interactions and deliveries.</div>";
     }
     document.getElementById("clearJurDetail").addEventListener("click", clearJurisdictionDetail);
+
+    function renderInteractionBreakdown(){
+      const rows = filteredInteractions(getFilters());
+      document.getElementById("interactionBreakdownMeta").textContent = rows.length + " interaction entries";
+      function renderRows(tbodyId, key, missing){
+        const counts = new Map();
+        rows.forEach(x => {
+          const label = String(x[key] || "").trim() || missing;
+          counts.set(label, (counts.get(label) || 0) + 1);
+        });
+        const tbody = document.getElementById(tbodyId);
+        tbody.innerHTML = "";
+        if (!counts.size){
+          const tr = tbody.insertRow();
+          const td = tr.insertCell(); td.colSpan = 2;
+          td.className = "muted"; td.textContent = "No interactions match the current filters.";
+          return;
+        }
+        Array.from(counts.entries()).sort((a,b) => b[1]-a[1] || a[0].localeCompare(b[0])).forEach(([label,n]) => {
+          const tr = tbody.insertRow();
+          tr.insertCell().textContent = label;
+          const td = tr.insertCell(); td.textContent = String(n); td.className = "num";
+        });
+      }
+      renderRows("interactionCategoryTbody", "TA / Activity Category (Resolved)", "Unclassified");
+      renderRows("interactionChannelTbody", "Interaction Type (Resolved)", "Not recorded");
+      renderRows("interactionFocusTbody", "Focus Area (Resolved)", "Not recorded");
+    }
 
     /* ===================== ITA / PLN tables ===================== */
     function renderActivityTables(){
@@ -2208,7 +2348,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderPlnTopics(plns);
     }
 
-    /* PLN sessions grouped by topic (Focus Area), honouring the current filters.
+    /* PLN meetings grouped by topic (Focus Area), honouring the current filters.
        "Jurisdictions reached" counts each jurisdiction once per topic, across completed sessions. */
     function renderPlnTopics(plns){
       const groups = {};
@@ -2292,12 +2432,13 @@ HTML_TEMPLATE = r"""<!doctype html>
         '<div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px; align-items:center;">' +
           '<span class="pill accent" style="background:' + accent + ';"><b>' + esc(label) + ' #' + esc(a.id) + '</b></span>' +
           '<span class="pill"><b>Date:</b> ' + esc(a.date) + '</span>' +
-          (a.location ? '<span class="pill"><b>Location:</b> ' + esc(a.location) + '</span>' : "") +
+          (a.location ? '<span class="pill"><b>' + (kind === "PLN" ? "Interaction type" : "Location") + ':</b> ' + esc(a.location) + '</span>' : "") +
           '<span class="badge ' + (a.complete ? "done" : "sched") + '">' + esc(a.complete ? "Complete" : (a.status || "Scheduled")) + '</span>' +
           '<span class="pill"><b>Jurisdictions:</b> ' + esc(a.jurisdiction_count) + '</span>' +
         '</div>' +
         '<div style="font-size:13px; margin-bottom:8px;"><b>Focus area(s):</b> ' + esc(a.focus_area || "—") + '</div>' +
-        (a.notes ? '<div style="font-size:13px; margin-bottom:8px;"><b>Meeting notes:</b> <a href="' + esc(a.notes) + '" target="_blank" rel="noopener">' + esc(a.notes) + '</a></div>' : "") +
+        (a.notes ? '<div style="font-size:13px; margin-bottom:8px;"><b>Session summary:</b> ' + esc(a.notes) + '</div>' : "") +
+        (a.ticket_ids && a.ticket_ids.length ? '<div style="font-size:13px; margin-bottom:8px;"><b>Tickets:</b> ' + esc(a.ticket_ids.join(", ")) + '</div>' : "") +
         '<div style="font-size:13px;"><b>Jurisdictions participating:</b><div style="margin-top:6px;">' + tags + '</div></div>';
       document.getElementById("activitySection").scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
@@ -2436,8 +2577,8 @@ HTML_TEMPLATE = r"""<!doctype html>
       (PAYLOAD.interactions || []).forEach(x => {
         const tid = String(x["Ticket ID"] || "").trim();
         const isOrphan = (tid === "" || tid === "No Ticket ID");
-        if (!isOrphan && !ids.has(tid)) return;
-        if (isOrphan && !f.allJur && !jurMatches(x["Jurisdiction"], f)) return;
+        if (!f.allJur && !jurMatches(x[JUR], f)) return;
+        if (!interactionMatchesSearch(x, f, searchTicketIds(f))) return;
         const k = periodKeyFromDate(x["Date of Interaction"], f.gran);
         if (k !== null && k in cInter) cInter[k] += 1;
       });
@@ -2632,6 +2773,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       setKPIs();
       renderTicketTable();
       renderJurisdictionSection();
+      renderInteractionBreakdown();
       renderActivityTables();
       renderTrendChart();
       renderActivityChart();
@@ -2752,14 +2894,14 @@ def build_dashboard(xlsx_path: str, out_html: str, extra_xlsx: str | None = None
     df_inter = normalize_interactions(sheets.get("Interaction", pd.DataFrame()))
     df_del = normalize_deliveries(sheets.get("Delivery", pd.DataFrame()))
 
-    # ITA / PLN workbook: default to a file of that name sitting next to the TA request file.
+    # Optional historical Intensive TA workbook. PLN sessions come only from Interaction.
     if extra_xlsx is None:
         extra_xlsx = os.path.join(os.path.dirname(os.path.abspath(xlsx_path)), DEFAULT_EXTRA_XLSX)
     extra = read_extra_activities(extra_xlsx)
 
     payload = compute_payload(
         df_main, df_inter, df_del,
-        df_ita=extra["ita"], df_pln=extra["pln"],
+        df_ita=extra["ita"], df_pln=None,
         id_col="Ticket ID",
     )
     # Look for logo.png in the same directory as the Excel file
@@ -2785,7 +2927,7 @@ if __name__ == "__main__":
         "--extra",
         default=None,
         help=(
-            "Path to 'HRSA064 Additional TA activities.xlsx' (ITA + PLN data). "
+            "Optional path to the historical Additional TA activities workbook (Intensives only). "
             "Defaults to a file of that name next to --xlsx."
         ),
     )
