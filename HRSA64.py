@@ -14,7 +14,6 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
-import uuid
 import smtplib
 from email.message import EmailMessage
 from mailjet_rest import Client
@@ -544,7 +543,7 @@ def normalize_interaction_dataframe(data):
     result = data.copy() if data is not None else pd.DataFrame()
     if "Type of Interaction" not in result.columns:
         result["Type of Interaction"] = ""
-    for col in ("Interaction Type", "TA / Activity Category", "Focus Area", "Activity ID"):
+    for col in ("Interaction Type", "TA / Activity Category", "Focus Area"):
         if col not in result.columns:
             result[col] = ""
     legacy = result["Type of Interaction"].fillna("").astype(str).str.strip().str.casefold()
@@ -641,28 +640,27 @@ def group_interactions(df_interactions):
 
 
 def _distinct_activity_count(df_rows):
-    """Distinct event count: prefer stable Activity ID, fallback to historical signature.
+    """Count one group activity per event, not per jurisdiction.
 
-    Multiple jurisdictions are separate rows for one event. Historic rows lack IDs.
+    An interaction is recorded once for each participating jurisdiction. The
+    shared date, ticket, category, meeting type, summary, and submitter serve
+    as a grouping signature, so the backend does not need a separate ID.
     """
     if df_rows is None or getattr(df_rows, "empty", True):
         return 0
     result = normalize_interaction_dataframe(df_rows)
-    signatures = []
+    signature_columns = (
+        "Date of Interaction", "Ticket ID", "TA / Activity Category",
+        "Type of Interaction", "Short Summary", "Submitted By",
+    )
+    signatures = set()
     for _, row in result.iterrows():
-        activity_id = str(row.get("Activity ID", "") or "").strip()
-        if activity_id and activity_id.lower() not in ("nan", "none"):
-            signatures.append(("id", activity_id))
-        else:
-            signatures.append((
-                "legacy",
-                str(row.get("Date of Interaction", "")).strip(),
-                str(row.get("TA / Activity Category", "")).strip(),
-                str(row.get("Type of Interaction", "")).strip(),
-                str(row.get("Short Summary", "")).strip(),
-                str(row.get("Submitted By", "")).strip(),
-            ))
-    return len(set(signatures))
+        signatures.add(tuple(
+            _dedup_date(row.get(col)) if col == "Date of Interaction"
+            else _dedup_text(row.get(col))
+            for col in signature_columns
+        ))
+    return len(signatures)
 
 
 def render_group_activity_section(df_interactions, key_prefix):
@@ -875,6 +873,14 @@ def _truthy(val):
     return str(val if val is not None else '').strip().lower() in ('true', 'yes', '1', 'y', 'on')
 
 
+def _ooo_returned(back_on, today=None):
+    """The seat is back starting on its 'Back on' date (inclusive)."""
+    if back_on is None or not str(back_on).strip():
+        return False
+    parsed = pd.to_datetime(back_on, errors='coerce')
+    return bool(pd.notna(parsed) and parsed.date() <= (today or datetime.now().date()))
+
+
 @st.cache_data(ttl=600)
 def load_out_of_office():
     """{seat: {'out': bool, 'back_on': 'YYYY-MM-DD' or ''}} — empty dict if tab missing."""
@@ -885,28 +891,50 @@ def load_out_of_office():
     except Exception:
         pass
     try:
-        rows = get_spreadsheet().worksheet(OOO_SHEET).get_all_records()
+        ws = get_spreadsheet().worksheet(OOO_SHEET)
+        rows = ws.get_all_records()
     except Exception:
         return state
-    for r in rows:
+
+    expired_sheet_rows = []
+    for row_number, r in enumerate(rows, start=2):
         seat = str(r.get('Seat', '') or '').strip()
-        if seat:
-            state[seat] = {
-                'out': _truthy(r.get('Out of Office', '')),
-                'back_on': str(r.get('Back On', '') or '').strip(),
-            }
+        if not seat:
+            continue
+        back_on = str(r.get('Back On', '') or '').strip()
+        stored_out = _truthy(r.get('Out of Office', ''))
+        has_returned = stored_out and _ooo_returned(back_on)
+        # Routing and the UI must read the effective status, not a stale TRUE flag.
+        state[seat] = {
+            'out': stored_out and not has_returned,
+            'back_on': back_on,
+            'expired': has_returned,
+        }
+        if has_returned:
+            expired_sheet_rows.append(row_number)
+
+    # Clear expired TRUE flags in the sheet as well, without replacing other rows
+    # or deleting the historical return date. A failed write cannot keep someone OOO.
+    if expired_sheet_rows:
+        try:
+            headers = ws.row_values(1)
+            status_column = headers.index('Out of Office') + 1
+            ws.batch_update([
+                {
+                    'range': gspread.utils.rowcol_to_a1(row_num, status_column),
+                    'values': [['FALSE']],
+                }
+                for row_num in expired_sheet_rows
+            ], value_input_option='RAW')
+        except Exception:
+            pass
     return state
 
 
 def seat_is_out(seat):
-    """True while the seat holder is marked out. A 'Back On' date ends it automatically."""
+    """Use the effective OOO flag; the return date ends coverage on that day."""
     info = load_out_of_office().get(seat) or {}
-    if not info.get('out'):
-        return False
-    back = pd.to_datetime(info.get('back_on') or None, errors='coerce')
-    if pd.notna(back) and datetime.now().date() >= back.date():
-        return False
-    return True
+    return bool(info.get('out')) and not _ooo_returned(info.get('back_on'))
 
 
 def line_signer_seat(primary_seat):
@@ -3120,31 +3148,50 @@ def render_out_of_office_panel(my_seat, is_admin, df_travel):
             backup = OOO_BACKUP_SEAT[seat]
             info = load_out_of_office().get(seat) or {}
             out_now = seat_is_out(seat)
+            today = datetime.now().date()
             back_val = pd.to_datetime(info.get('back_on') or None, errors='coerce')
+            back_date = back_val.date() if pd.notna(back_val) else None
+            back_key = f"ooo_back_{seat}"
+            flag_key = f"ooo_flag_{seat}"
+
+            # Streamlit retains keyed widget values across reruns. Discard a past
+            # return date before creating a date_input with a future-only range.
+            if info.get('expired') or _ooo_returned(info.get('back_on')):
+                expiry_token = f"ooo_reset_after_{seat}"
+                if st.session_state.get(expiry_token) != str(info.get('back_on')):
+                    st.session_state[flag_key] = False
+                    st.session_state[back_key] = None
+                    st.session_state[expiry_token] = str(info.get('back_on'))
+            if _ooo_returned(st.session_state.get(back_key)):
+                st.session_state[back_key] = None
+            if back_date is not None and back_date <= today:
+                back_date = None
+
             c1, c2, c3 = st.columns([2.2, 1.6, 1])
             with c1:
                 flag = st.checkbox(
                     f"{approver(seat, 'name')} is out — {approver(backup, 'name')} covers",
                     value=out_now,
-                    key=f"ooo_flag_{seat}",
+                    key=flag_key,
                 )
             with c2:
                 back_on = st.date_input(
                     "Back on (optional)",
-                    value=back_val.date() if pd.notna(back_val) else None,
-                    min_value=datetime.now().date(),
-                    key=f"ooo_back_{seat}",
+                    value=back_date,
+                    min_value=today + timedelta(days=1),
+                    key=back_key,
                 )
             with c3:
                 st.write("")
                 save = st.button("Save", key=f"ooo_save_{seat}", use_container_width=True)
             if save:
                 try:
+                    effective_flag = bool(flag) and not _ooo_returned(back_on)
                     save_out_of_office(
-                        seat, flag, back_on,
+                        seat, effective_flag, back_on if effective_flag else None,
                         st.session_state.get('user_display_name') or st.session_state.get('user_email', ''),
                     )
-                    if flag and not out_now:
+                    if effective_flag and not out_now:
                         if _notify_backup_of_handover(seat, back_on, df_travel):
                             st.success(f"Saved. {approver(backup, 'name')} was emailed that they're covering.")
                         else:
@@ -3895,6 +3942,17 @@ comment_history_columns = [
 for _col in comment_history_columns:
     if _col not in df.columns:
         df[_col] = ""
+
+def update_interaction_worksheet(worksheet, records):
+    """Write interaction records, adding worksheet capacity for new columns if needed."""
+    required_columns = len(records.columns)
+    required_rows = len(records) + 1  # heading row
+    if worksheet.col_count < required_columns:
+        worksheet.add_cols(required_columns - worksheet.col_count)
+    if worksheet.row_count < required_rows:
+        worksheet.add_rows(required_rows - worksheet.row_count)
+    worksheet.update([records.columns.tolist()] + records.values.tolist())
+
 
 @st.cache_data(ttl=600)
 def load_interaction_sheet():
@@ -5590,7 +5648,7 @@ else:
                         df_int_coord = own_interactions(df_int, coordinator_name)
                         if not df_int_coord.empty:
                             # Remove columns we don't want to display
-                            display_cols = [col for col in df_int_coord.columns if col not in ['Submitted By', 'Submission Date']]
+                            display_cols = [col for col in df_int_coord.columns if col not in ['Submitted By', 'Submission Date', 'Activity ID']]
                             df_int_coord_display = df_int_coord[display_cols].copy()
                             
                             # Sort by Date of Interaction (most recent first)
@@ -5662,7 +5720,7 @@ else:
                                 
                                 if not df_ticket_int.empty:
                                     # Remove columns we don't want to display
-                                    display_cols_ticket = [col for col in df_ticket_int.columns if col not in ['Submission Date']]
+                                    display_cols_ticket = [col for col in df_ticket_int.columns if col not in ['Submission Date', 'Activity ID']]
                                     df_ticket_int_display = df_ticket_int[display_cols_ticket].copy()
                                     
                                     # Sort by Date of Interaction (most recent first)
@@ -5813,7 +5871,6 @@ else:
                                     else:
                                         jurisdiction_values = [jurisdiction_for_no_ticket or ""]
 
-                                activity_id_int = str(uuid.uuid4())  # shared across jurisdictions
                                 rows_int = [
                                     {
                                         'Ticket ID': ticket_id_int,
@@ -5822,7 +5879,6 @@ else:
                                         "Interaction Type": type_interaction,
                                         "TA / Activity Category": activity_category,
                                         "Focus Area": focus_area_interaction,
-                                        "Activity ID": activity_id_int,
                                         "Short Summary": interaction_description,
                                         "Document": drive_links_int,
                                         "Jurisdiction": juris,
@@ -5848,7 +5904,7 @@ else:
                                     )
                                     _report_dedup(_dupes_removed, "interaction")
                                     worksheet2 = spreadsheet2.worksheet('Interaction')
-                                    worksheet2.update([updated_sheet1.columns.values.tolist()] + updated_sheet1.values.tolist())
+                                    update_interaction_worksheet(worksheet2, updated_sheet1)
 
                                     # Clear cache to refresh data
                                     load_interaction_sheet.clear()  # only the sheet just written, not every cached loader
@@ -7484,7 +7540,7 @@ GU-TAP System
                     df_int_staff = own_interactions(df_int, staff_name)
                     if not df_int_staff.empty:
                         # Remove columns we don't want to display
-                        display_cols = [col for col in df_int_staff.columns if col not in ['Submitted By', 'Submission Date']]
+                        display_cols = [col for col in df_int_staff.columns if col not in ['Submitted By', 'Submission Date', 'Activity ID']]
                         df_int_staff_display = df_int_staff[display_cols].copy()
                         
                         # Sort by Date of Interaction (most recent first)
@@ -7557,7 +7613,7 @@ GU-TAP System
                             
                             if not df_ticket_int_staff.empty:
                                 # Remove columns we don't want to display
-                                display_cols_ticket_staff = [col for col in df_ticket_int_staff.columns if col not in ['Submission Date']]
+                                display_cols_ticket_staff = [col for col in df_ticket_int_staff.columns if col not in ['Submission Date', 'Activity ID']]
                                 df_ticket_int_staff_display = df_ticket_int_staff[display_cols_ticket_staff].copy()
                                 
                                 # Sort by Date of Interaction (most recent first)
@@ -7724,7 +7780,6 @@ GU-TAP System
                                 else:
                                     jurisdiction_values = [jurisdiction_for_no_ticket or ""]
 
-                            activity_id_int = str(uuid.uuid4())  # shared across jurisdictions
                             rows_int = [
                                 {
                                     'Ticket ID': ticket_id_int,
@@ -7733,7 +7788,6 @@ GU-TAP System
                                     "Interaction Type": type_interaction,
                                     "TA / Activity Category": activity_category,
                                     "Focus Area": focus_area_interaction,
-                                    "Activity ID": activity_id_int,
                                     "Short Summary": interaction_description,
                                     "Document": drive_links_int,
                                     "Jurisdiction": juris,
@@ -7761,7 +7815,7 @@ GU-TAP System
                                 )
                                 _report_dedup(_dupes_removed, "interaction")
                                 worksheet3 = spreadsheet3.worksheet('Interaction')
-                                worksheet3.update([updated_sheet2.columns.values.tolist()] + updated_sheet2.values.tolist())
+                                update_interaction_worksheet(worksheet3, updated_sheet2)
 
                                 # Clear cache to refresh data
                                 load_interaction_sheet.clear()  # only the sheet just written, not every cached loader
@@ -9046,7 +9100,7 @@ GU-TAP System
                     df_del_staff = df_del[df_del["Submitted By"] == staff_name].copy()
                     if not df_del_staff.empty:
                         # Remove columns we don't want to display
-                        display_cols = [col for col in df_del_staff.columns if col not in ['Submitted By', 'Submission Date']]
+                        display_cols = [col for col in df_del_staff.columns if col not in ['Submitted By', 'Submission Date', 'Activity ID']]
                         df_del_staff_display = df_del_staff[display_cols].copy()
                         
                         # Sort by Date of Delivery (most recent first)
@@ -9117,7 +9171,7 @@ GU-TAP System
                             
                             if not df_ticket_del.empty:
                                 # Remove columns we don't want to display
-                                display_cols_ticket_del = [col for col in df_ticket_del.columns if col not in ['Submission Date']]
+                                display_cols_ticket_del = [col for col in df_ticket_del.columns if col not in ['Submission Date', 'Activity ID']]
                                 df_ticket_del_display = df_ticket_del[display_cols_ticket_del].copy()
                                 
                                 # Sort by Date of Delivery (most recent first)
@@ -10559,7 +10613,6 @@ GU-TAP System
                                         else:
                                             ra_juris_values = [ra_juris_no_ticket or ""]
 
-                                    ra_activity_id = str(uuid.uuid4())  # one event, many jurisdictions
                                     ra_rows_int = [
                                         {
                                             "Ticket ID": ra_ticket_int,
@@ -10568,7 +10621,6 @@ GU-TAP System
                                             "Interaction Type": ra_type_int,
                                             "TA / Activity Category": ra_activity_category,
                                             "Focus Area": ra_focus_area,
-                                            "Activity ID": ra_activity_id,
                                             "Short Summary": ra_summary_int,
                                             "Document": ra_links_int,
                                             "Jurisdiction": ra_juris,
@@ -10594,10 +10646,7 @@ GU-TAP System
                                         )
                                         _report_dedup(_dupes_removed, "interaction")
                                         ra_ws_int = get_spreadsheet().worksheet("Interaction")
-                                        ra_ws_int.update(
-                                            [ra_updated_int.columns.values.tolist()]
-                                            + ra_updated_int.values.tolist()
-                                        )
+                                        update_interaction_worksheet(ra_ws_int, ra_updated_int)
                                         load_interaction_sheet.clear()  # only the sheet just written, not every cached loader
                                         st.success(
                                             f"✅ Logged {len(ra_rows_int)} interaction row(s) for {ra_provider}."
