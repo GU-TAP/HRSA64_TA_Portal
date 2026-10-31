@@ -488,11 +488,11 @@ client = gspread.authorize(creds)
 # New records use "Interaction Type" and "TA / Activity Category", leaving the old
 # column blank. Never infer the communication channel of old PLN/webinar entries.
 INTERACTION_TYPES = [
-    "Ad-Hoc Peer Exchange", "E-mail", "Phone Call", "Online Meeting (Virtual)",
+    "E-mail", "Phone Call", "Online Meeting (Virtual)",
     "In-Person Meeting", "Document or Material Sharing", "Other",
 ]
 TA_ACTIVITY_CATEGORIES = [
-    "Peer Learning Network Meeting (PLN)", "1-on-1 TA", "Office Hours",
+    "Peer Learning Network Meeting (PLN)", "1-on-1 TA", "Ad-Hoc Peer Exchange", "Office Hours",
     "Webinar", "Intensive Technical Assistance Workshop", "Other",
 ]
 # Shared by the requester form and the standalone Interaction logging forms.
@@ -507,13 +507,14 @@ TA_FOCUS_AREA_OPTIONS = sorted([
 
 SHARED_ACTIVITY_CATEGORIES = {
     "Peer Learning Network Meeting (PLN)", "Office Hours", "Webinar",
-    "Intensive Technical Assistance Workshop",
+    "Intensive Technical Assistance Workshop", "Ad-Hoc Peer Exchange",
 }
 LEGACY_ACTIVITY_CATEGORIES = {
     "peer learning meetings (plns)": "Peer Learning Network Meeting (PLN)",
     "peer learning meeting (pln)": "Peer Learning Network Meeting (PLN)",
     "webinars": "Webinar", "webinar": "Webinar",
     "office hours": "Office Hours",
+    "ad-hoc peer exchange": "Ad-Hoc Peer Exchange",
 }
 LEGACY_INTERACTION_CHANNELS = {
     "email": "E-mail", "e-mail": "E-mail", "phone call": "Phone Call",
@@ -610,12 +611,12 @@ def render_interaction_classification(ticket_id, df_main, key_prefix):
 
 
 def _group_activity_label(data):
-    """Shared-activity label; Ad-Hoc Peer Exchange is selected in Interaction Type."""
+    """Prefer the TA category; support historical entries incorrectly stored as channels."""
     normalized = normalize_interaction_dataframe(data)
     category = normalized["TA / Activity Category"].fillna("").astype(str).str.strip()
     channel = normalized["Interaction Type"].fillna("").astype(str).str.strip()
     ad_hoc = channel.str.casefold().eq("ad-hoc peer exchange")
-    return category.mask(ad_hoc, "Ad-Hoc Peer Exchange")
+    return category.mask(category.eq("") & ad_hoc, "Ad-Hoc Peer Exchange")
 
 
 def _is_shared_activity(data):
@@ -794,6 +795,432 @@ def get_spreadsheet(name=MAIN_SPREADSHEET):
     hour and reused. This is the single biggest source of Sheets read-quota usage.
     """
     return client.open(name)
+
+
+# Ticket progress, phase records, and post-completion surveys.
+# Data lives in the existing HRSA64_TA_Request Google spreadsheet.
+from uuid import uuid4
+
+TA_MAIN_EXTRA_COLUMNS = (
+    'TA Hours', 'Survey Recipients', 'Survey Status', 'Survey Sent To',
+    'Survey Sent At', 'Overall Progress (%)', 'Progress Note',
+    'Progress Updated At', 'Progress Updated By',
+)
+TA_PHASE_SHEET = 'TA_Ticket_Phases'
+TA_PHASE_COLUMNS = (
+    'Phase ID', 'Ticket ID', 'Phase Name', 'Status', 'Start Date',
+    'Target Date', 'Progress (%)', 'Notes', 'Created At', 'Updated At', 'Updated By',
+)
+TA_PROGRESS_HISTORY_SHEET = 'TA_Progress_History'
+TA_PROGRESS_HISTORY_COLUMNS = (
+    'Ticket ID', 'Overall Progress (%)', 'Progress Note', 'Updated At', 'Updated By',
+)
+TA_PHASE_STATUSES = ('Not started', 'In progress', 'Blocked', 'Complete')
+TA_EMAIL_RE = re.compile(r'^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$')
+
+
+def _ta_sheet(name, columns):
+    """Create an optional TA worksheet when first used; preserve existing data."""
+    spreadsheet = get_spreadsheet()
+    try:
+        ws = spreadsheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=name, rows=100, cols=max(15, len(columns)))
+    _ta_ensure_columns(ws, columns)
+    return ws
+
+
+def _ta_ensure_columns(ws, columns):
+    headers = list(ws.row_values(1))
+    if not headers:
+        headers = []
+    missing = [col for col in columns if col not in headers]
+    if not missing:
+        return headers
+    needed = len(headers) + len(missing)
+    if ws.col_count < needed:
+        ws.add_cols(needed - ws.col_count)
+    headers.extend(missing)
+    ws.update(range_name='A1', values=[headers], value_input_option='RAW')
+    return headers
+
+
+def _ta_main_row(ticket_id):
+    """Return live Main row position and values (not a cached dataframe index)."""
+    ws = get_spreadsheet().worksheet('Main')
+    headers = _ta_ensure_columns(ws, TA_MAIN_EXTRA_COLUMNS)
+    records = ws.get_all_records(default_blank='')
+    matches = [(index + 2, row) for index, row in enumerate(records)
+               if str(row.get('Ticket ID', '')).strip() == str(ticket_id).strip()]
+    if len(matches) != 1:
+        raise ValueError('Ticket could not be uniquely identified in the Main worksheet.')
+    row_number, record = matches[0]
+    return ws, headers, row_number, record
+
+
+def _ta_write_ticket_fields(ticket_id, values):
+    ws, headers, row_number, record = _ta_main_row(ticket_id)
+    required = [name for name in values if name not in headers]
+    if required:
+        headers = _ta_ensure_columns(ws, required)
+    updates = [
+        {'range': gspread.utils.rowcol_to_a1(row_number, headers.index(col) + 1),
+         'values': [[str(value if value is not None else '')]]}
+        for col, value in values.items()
+    ]
+    if updates:
+        ws.batch_update(updates, value_input_option='RAW')
+    load_main_sheet.clear()
+
+
+def _ta_timestamp():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _ta_percentage(value):
+    try:
+        number = float(value or 0)
+        if pd.isna(number):
+            return 0
+        return max(0, min(100, int(number)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _ta_save_overall_progress(ticket_id, percent, note, updated_by):
+    percent = _ta_percentage(percent)
+    previous = _ta_main_row(ticket_id)[3]
+    old_pct = str(previous.get('Overall Progress (%)', '')).strip()
+    old_note = str(previous.get('Progress Note', '')).strip()
+    if old_pct == str(percent) and old_note == (note or '').strip():
+        return False
+    now = _ta_timestamp()
+    _ta_write_ticket_fields(ticket_id, {
+        'Overall Progress (%)': percent,
+        'Progress Note': (note or '').strip(),
+        'Progress Updated At': now, 'Progress Updated By': updated_by,
+    })
+    history = _ta_sheet(TA_PROGRESS_HISTORY_SHEET, TA_PROGRESS_HISTORY_COLUMNS)
+    history.append_row([ticket_id, percent, (note or '').strip(), now, updated_by], value_input_option='RAW')
+    return True
+
+
+def _ta_phases(ticket_id):
+    ws = _ta_sheet(TA_PHASE_SHEET, TA_PHASE_COLUMNS)
+    return [r for r in ws.get_all_records(default_blank='')
+            if str(r.get('Ticket ID', '')).strip() == str(ticket_id).strip()]
+
+
+def _ta_save_phase(ticket_id, phase_id, name, status, start_date, target_date, percent, notes, actor):
+    ticket_id = str(ticket_id).strip()
+    if not ticket_id or not str(name).strip():
+        raise ValueError('A ticket and phase name are required.')
+    if status not in TA_PHASE_STATUSES:
+        raise ValueError('Choose a valid phase status.')
+    percent = _ta_percentage(percent)
+    if status == 'Complete':
+        percent = 100
+    now = _ta_timestamp()
+    ws = _ta_sheet(TA_PHASE_SHEET, TA_PHASE_COLUMNS)
+    headers = ws.row_values(1)
+    rows = ws.get_all_records(default_blank='')
+    existing = [(i + 2, r) for i, r in enumerate(rows)
+                if str(r.get('Phase ID', '')).strip() == str(phase_id).strip()] if phase_id else []
+    if phase_id and (len(existing) != 1 or str(existing[0][1].get('Ticket ID','')).strip() != ticket_id):
+        raise ValueError('The phase could not be located for this ticket.')
+    record = dict(zip(TA_PHASE_COLUMNS, [
+        phase_id or str(uuid4()), ticket_id, str(name).strip(), status,
+        str(start_date or ''), str(target_date or ''), percent, (notes or '').strip(),
+        existing[0][1].get('Created At', now) if existing else now, now, actor,
+    ]))
+    if existing:
+        row_number = existing[0][0]
+        ws.update(range_name=f'A{row_number}', values=[[record.get(col, '') for col in headers]], value_input_option='RAW')
+    else:
+        ws.append_row([record.get(col, '') for col in headers], value_input_option='RAW')
+    return record['Phase ID']
+
+
+def _ta_delete_phase(ticket_id, phase_id):
+    ws = _ta_sheet(TA_PHASE_SHEET, TA_PHASE_COLUMNS)
+    matches = [(i + 2, r) for i, r in enumerate(ws.get_all_records(default_blank=''))
+               if str(r.get('Phase ID', '')).strip() == str(phase_id).strip()
+               and str(r.get('Ticket ID', '')).strip() == str(ticket_id).strip()]
+    if len(matches) != 1:
+        raise ValueError('The phase could not be located for this ticket.')
+    ws.delete_rows(matches[0][0])
+
+
+def _ta_survey_url():
+    try:
+        url = str(st.secrets['ta_survey']['url']).strip()
+    except (KeyError, AttributeError, TypeError):
+        url = ''
+    return url if re.match(r'^https://\S+\.[^\s]+$', url, re.I) else ''
+
+
+def _ta_parse_emails(text):
+    values = [x.strip().lower() for x in re.split(r'[,;\n]+', str(text or '')) if x.strip()]
+    if any(not TA_EMAIL_RE.fullmatch(x) for x in values):
+        raise ValueError('Enter valid email addresses separated by commas or semicolons.')
+    return list(dict.fromkeys(values))
+
+
+def _ta_survey_body(ticket_id):
+    return (
+        'Hello,\n\n'
+        'Thank you for participating in technical assistance provided by the Georgetown University '
+        'TA Program. We would appreciate your feedback on the assistance associated with '
+        f'ticket {ticket_id}.\n\n'
+        f'Please complete this brief survey: {_ta_survey_url()}\n\n'
+        'Your feedback will help us improve technical assistance services.\n\n'
+        'Thank you,\nGU-TAP Team'
+    )
+
+
+def _ta_dispatch_survey(ticket_id):
+    """Send once per address; persist each success so retries skip it."""
+    ws, headers, row_number, record = _ta_main_row(ticket_id)
+    recipients = _ta_parse_emails(record.get('Survey Recipients', ''))
+    if not recipients:
+        _ta_write_ticket_fields(ticket_id, {'Survey Status': 'Not requested'})
+        return 0, 0, 'No survey recipients selected.'
+    if not _ta_survey_url():
+        _ta_write_ticket_fields(ticket_id, {'Survey Status': 'Pending survey link'})
+        return 0, len(recipients), 'Survey recipients saved. Sending will be available when the survey link is configured.'
+    already = set(_ta_parse_emails(record.get('Survey Sent To', '')))
+    success = 0
+    failures = 0
+    for email in recipients:
+        if email in already:
+            continue
+        try:
+            ok = send_email_mailjet(email, f'GU-TAP feedback survey — {ticket_id}', _ta_survey_body(ticket_id))
+        except Exception:
+            ok = False
+        if ok:
+            already.add(email)
+            success += 1
+            # Record each success immediately, including partial-success retries.
+            _ta_write_ticket_fields(ticket_id, {
+                'Survey Sent To': '; '.join(sorted(already)),
+                'Survey Sent At': _ta_timestamp(),
+                'Survey Status': 'Partial' if len(already) < len(recipients) else 'Sent',
+            })
+        else:
+            failures += 1
+    _ta_write_ticket_fields(ticket_id, {
+        'Survey Status': 'Sent' if all(e in already for e in recipients) else 'Pending retry',
+    })
+    return success, failures, 'Survey invitations processed.'
+
+
+def render_ta_phases(df_main, provider_name):
+    """Persistent phase editor based on the demo design (not session-state mock data)."""
+    with st.expander('📈 PHASES & PROGRESS TRACKING'):
+        assigned = df_main.loc[
+            (df_main['Assigned Coach'].astype(str).str.strip() == str(provider_name).strip())
+            & (df_main['Status'].astype(str).str.strip().isin(['In Progress', 'Completed']))
+        ]
+        ids = assigned['Ticket ID'].dropna().astype(str).str.strip().unique().tolist()
+        if not ids:
+            st.info('No assigned tickets available.')
+            return
+        ticket_id = st.selectbox('Select ticket', ids, key='ta_phase_ticket')
+        current = assigned[assigned['Ticket ID'].astype(str) == ticket_id].iloc[0]
+        current_pct = _ta_percentage(current.get('Overall Progress (%)', 0))
+        current_note = str(current.get('Progress Note', '') or '')
+        if current_note.lower() == 'nan':
+            current_note = ''
+        st.progress(current_pct / 100)
+        st.caption(f'Overall progress: {current_pct}%')
+        with st.form(f'ta_overall_form_{ticket_id}'):
+            percentage = st.slider('Overall progress (%)', 0, 100, current_pct, step=5)
+            note = st.text_area('Progress note', value=current_note, help='Summarize the latest accomplishments or blockers.')
+            if st.form_submit_button('Save overall progress'):
+                try:
+                    _ta_save_overall_progress(ticket_id, percentage, note, provider_name)
+                    st.success('Progress saved.')
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f'Unable to save progress: {ex}')
+        phases = _ta_phases(ticket_id)
+        st.markdown('#### Ticket phases')
+        if not phases:
+            st.info('No phases have been added to this ticket.')
+        for p in phases:
+            phase_id = str(p.get('Phase ID', '')).strip()
+            name = str(p.get('Phase Name', ''))
+            status = str(p.get('Status', 'Not started'))
+            percent = _ta_percentage(p.get('Progress (%)', 0))
+            start_str = str(p.get('Start Date', '')).strip()
+            target_str = str(p.get('Target Date', '')).strip()
+            start_dt = pd.to_datetime(start_str, errors='coerce')
+            target_dt = pd.to_datetime(target_str, errors='coerce')
+            st.markdown(f'**{html.escape(name)}** — {html.escape(status)} · {percent}%')
+            st.progress(percent / 100)
+            with st.form(f'ta_edit_phase_{phase_id}'):
+                revised_name = st.text_input('Phase name', value=name)
+                revised_status = st.selectbox('Status', list(TA_PHASE_STATUSES),
+                    index=list(TA_PHASE_STATUSES).index(status) if status in TA_PHASE_STATUSES else 0)
+                revised_percent = st.slider('Progress (%)', 0, 100, percent, step=5)
+                c1, c2 = st.columns(2)
+                with c1:
+                    use_start = st.checkbox('Set start date', value=pd.notna(start_dt))
+                    revised_start = st.date_input('Start date', value=start_dt.date() if pd.notna(start_dt) else datetime.now().date(), disabled=not use_start)
+                with c2:
+                    use_target = st.checkbox('Set target date', value=pd.notna(target_dt))
+                    revised_target = st.date_input('Target date', value=target_dt.date() if pd.notna(target_dt) else datetime.now().date() + timedelta(days=30), disabled=not use_target)
+                revised_notes = st.text_area('Phase notes', value=str(p.get('Notes', '') or ''))
+                if st.form_submit_button('Save phase'):
+                    try:
+                        _ta_save_phase(ticket_id, phase_id, revised_name, revised_status,
+                          revised_start if use_start else '', revised_target if use_target else '',
+                          revised_percent, revised_notes, provider_name)
+                        st.success('Phase saved.')
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f'Unable to save phase: {ex}')
+            confirm_delete = st.checkbox('Confirm delete', key=f'ta_delete_check_{phase_id}')
+            if st.button('Delete phase', key=f'ta_delete_button_{phase_id}', disabled=not confirm_delete):
+                try:
+                    _ta_delete_phase(ticket_id, phase_id)
+                    st.success('Phase deleted.')
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f'Unable to delete phase: {ex}')
+        st.markdown('#### Add a phase')
+        with st.form(f'ta_new_phase_{ticket_id}'):
+            new_name = st.text_input('Phase name *')
+            new_status = st.selectbox('Status', TA_PHASE_STATUSES)
+            new_progress = st.slider('Progress (%)', 0, 100, 0, step=5)
+            c1, c2 = st.columns(2)
+            with c1:
+                set_start = st.checkbox('Set start date', value=False)
+                new_start = st.date_input('Start date', value=datetime.now().date(), disabled=not set_start)
+            with c2:
+                new_target = st.date_input('Target date', value=datetime.now().date() + timedelta(days=30))
+            new_notes = st.text_area('Phase notes')
+            if st.form_submit_button('Add phase'):
+                try:
+                    _ta_save_phase(ticket_id, '', new_name, new_status,
+                        new_start if set_start else '', new_target, new_progress, new_notes, provider_name)
+                    st.success('Phase added.')
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f'Unable to add phase: {ex}')
+
+
+def render_ta_progress_overview(df_main):
+    """Read-only status and phase details for coordinators."""
+    with st.expander('📈 TICKET PROGRESS & PHASES'):
+        active = df_main.loc[df_main['Status'].astype(str).isin(['In Progress', 'Completed'])].copy()
+        if active.empty:
+            st.info('No tickets available.')
+            return
+        ids = active['Ticket ID'].dropna().astype(str).unique().tolist()
+        ticket_id = st.selectbox('Select ticket', ids, key='ta_coord_progress_ticket')
+        ticket = active.loc[active['Ticket ID'].astype(str) == ticket_id].iloc[0]
+        percent = _ta_percentage(ticket.get('Overall Progress (%)', 0))
+        st.markdown(f"**{html.escape(ticket_id)}** · {html.escape(str(ticket.get('Assigned Coach', '')))} · {percent}% complete")
+        st.progress(percent / 100)
+        note = str(ticket.get('Progress Note', '') or '').strip()
+        if note and note.lower() != 'nan':
+            st.write(note)
+        phases = _ta_phases(ticket_id)
+        if phases:
+            table = pd.DataFrame(phases)
+            columns = ['Phase Name', 'Status', 'Start Date', 'Target Date', 'Progress (%)', 'Notes', 'Updated At']
+            show_df(table[[col for col in columns if col in table.columns]].reset_index(drop=True))
+        else:
+            st.info('No phases have been added to this ticket.')
+        history_ws = _ta_sheet(TA_PROGRESS_HISTORY_SHEET, TA_PROGRESS_HISTORY_COLUMNS)
+        updates = [r for r in history_ws.get_all_records(default_blank='')
+                   if str(r.get('Ticket ID', '')).strip() == ticket_id]
+        if updates:
+            st.markdown('#### Recent progress updates')
+            show_df(pd.DataFrame(updates).tail(20).iloc[::-1].reset_index(drop=True))
+
+
+def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
+    """Ticket closure with optional hours and recipient-driven survey invitations."""
+    with st.expander('✅ MARK REQUESTS AS COMPLETED'):
+        if staff_df.empty:
+            st.info('No in-progress tickets to complete.')
+        else:
+            ids = staff_df.index.tolist()
+            index = st.selectbox('Select ticket to complete', ids,
+                format_func=lambda i: f"{staff_df.at[i, 'Ticket ID']} | {staff_df.at[i, 'Jurisdiction']}",
+                key='ta_completion_ticket')
+            ticket = staff_df.loc[index]
+            ticket_id = str(ticket.get('Ticket ID', '')).strip()
+            requester_email = str(ticket.get('Email Address', '') or '').strip()
+            with st.form(f'ta_ticket_close_{ticket_id}'):
+                ta_hours_text = st.text_input('TA hours (optional)', placeholder='e.g., 4.5',
+                    help='Leave blank if hours are not available.')
+                st.markdown('**Survey recipients**')
+                include_requester = st.checkbox('Requester', value=True)
+                include_provider = st.checkbox('TA provider', value=False)
+                other_recipients = st.text_area('Other participants (email addresses)',
+                    placeholder='One or more emails, separated by commas or semicolons')
+                submitted = st.form_submit_button('Mark as completed', type='primary')
+            if submitted:
+                try:
+                    hours_text = ta_hours_text.strip()
+                    if hours_text:
+                        try:
+                            ta_hours = float(hours_text)
+                        except ValueError:
+                            raise ValueError('TA hours must be a number or left blank.')
+                        if not (0 <= ta_hours < 100000):
+                            raise ValueError('TA hours must be a non-negative number.')
+                    else:
+                        ta_hours = None
+                    addresses = []
+                    if include_requester:
+                        addresses.extend(_ta_parse_emails(requester_email))
+                    if include_provider:
+                        addresses.extend(_ta_parse_emails(staff_email))
+                    addresses.extend(_ta_parse_emails(other_recipients))
+                    addresses = list(dict.fromkeys(addresses))
+                    if include_requester and not requester_email:
+                        raise ValueError('This ticket has no requester email on file.')
+                    if include_provider and not staff_email:
+                        raise ValueError('The TA provider email is not available.')
+                    _ta_write_ticket_fields(ticket_id, {
+                        'Status': 'Completed',
+                        'Close Date': datetime.now().strftime('%Y-%m-%d'),
+                        'TA Hours': '' if ta_hours is None else ta_hours,
+                        'Survey Recipients': '; '.join(addresses),
+                        'Survey Status': ('Pending' if addresses else 'Not requested'),
+                        'Survey Sent To': '', 'Survey Sent At': '',
+                    })
+                    sent, failures, message = _ta_dispatch_survey(ticket_id)
+                    st.success('Ticket marked as completed.')
+                    if addresses:
+                        st.info(message if sent == 0 else f'Survey invitations sent to {sent} recipient(s).')
+                    if failures:
+                        st.warning(f'{failures} invitation(s) could not be sent. You can retry below.')
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f'Unable to complete this ticket: {ex}')
+        # Allow deferred sends after a survey link is finalized or a delivery fails.
+        pending = all_df[
+            (all_df['Assigned Coach'].astype(str) == str(staff_name))
+            & (all_df['Status'].astype(str) == 'Completed')
+            & (all_df.get('Survey Status', pd.Series('', index=all_df.index)).astype(str).isin(
+                ('Pending', 'Pending retry', 'Pending survey link', 'Partial')))
+        ].copy()
+        if not pending.empty:
+            st.markdown('#### Pending survey invitations')
+            chosen = st.selectbox('Ticket', pending['Ticket ID'].astype(str).tolist(), key='ta_survey_pending_ticket')
+            if st.button('Send pending survey invitations', key='ta_send_pending_survey'):
+                try:
+                    sent, failed, msg = _ta_dispatch_survey(chosen)
+                    st.success(msg if not failed else f'Sent: {sent}. Failed: {failed}.')
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f'Unable to send survey invitations: {ex}')
 
 
 def _is_quota_error(exc) -> bool:
@@ -3959,6 +4386,11 @@ comment_history_columns = [
     "Staff Comment History",
 ]
 for _col in comment_history_columns:
+    if _col not in df.columns:
+        df[_col] = ""
+
+# Retain added columns in any legacy full-sheet write paths.
+for _col in TA_MAIN_EXTRA_COLUMNS:
     if _col not in df.columns:
         df[_col] = ""
 
@@ -7308,6 +7740,8 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
+                render_ta_progress_overview(df)
+
             elif st.session_state.role == "Assignee/Staff":
                 # Add staff content here
                 user_info = USERS.get(st.session_state.user_email)
@@ -7533,6 +7967,9 @@ GU-TAP System
                             except Exception as e:
                                 st.error(f"Error saving comment: {str(e)}")
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
+
+                render_ta_phases(df, staff_name)
+                st.divider()
 
                 with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
                     st.markdown("""
@@ -9651,90 +10088,8 @@ GU-TAP System
                                 st.rerun()
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                # --- Section 1: Mark as Completed
-                with st.expander("✅ **MARK REQUESTS AS COMPLETED**"):
-                    st.markdown("""
-                        <div class="gutap-hero">
-                            <div class="gutap-hero-title">
-                                ✅ Request Completion Center
-                            </div>
-                            <div class="gutap-hero-sub">
-                                Mark your assigned requests as completed when finished. Review request details and finalize your work efficiently.
-                            </div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                    if staff_df.empty:
-                        st.info("No requests currently in progress to mark as completed.")
-                    else:
-                        # Ensure datetime before using .dt
-                        staff_df["Assigned Date"] = pd.to_datetime(staff_df["Assigned Date"], errors="coerce")
-                        staff_df["Targeted Due Date"] = pd.to_datetime(staff_df["Targeted Due Date"], errors="coerce")
-
-                        # Format dates
-                        staff_df["Assigned Date"] = staff_df["Assigned Date"].dt.strftime("%Y-%m-%d")
-                        staff_df["Targeted Due Date"] = staff_df["Targeted Due Date"].dt.strftime("%Y-%m-%d")
-
-                        # Display clean table (exclude PriorityOrder column)
-                        show_df(staff_df[[
-                            "Ticket ID","Jurisdiction", "Organization", "Name", "Title/Position", "Email Address", "Phone Number",
-                            "Focus Area", "TA Type", "Assigned Date", "Targeted Due Date", "Priority", "TA Description","Document","Coordinator Comment History"
-                        ]].reset_index(drop=True))
-
-                        # Select request by index (row number in submitted_requests)
-                        request_indices = staff_df.index.tolist()
-                        selected_request_index = st.selectbox(
-                            "Select a request to marked as completed",
-                            options=request_indices,
-                            format_func=lambda idx: f"{staff_df.at[idx, 'Ticket ID']} | {staff_df.at[idx, 'Name']} | {staff_df.at[idx, 'Jurisdiction']}",
-                        )
-
-
-                        # Submit completion
-                        if st.button("✅ Mark as Completed"):
-                            try:
-                                # Map back to original df index
-                                global_index = staff_df.loc[selected_request_index].name
-
-                                # Copy + update
-                                updated_df = df.copy()
-                                updated_df.loc[global_index, "Status"] = "Completed"
-                                updated_df.loc[global_index, "Close Date"] = datetime.today().strftime("%Y-%m-%d")
-
-                                updated_df = updated_df.applymap(
-                                    lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (pd.Timestamp, datetime)) and not pd.isna(x) else x
-                                )
-                                updated_df = updated_df.fillna("") 
-                                spreadsheet1 = get_spreadsheet()
-                                worksheet1 = spreadsheet1.worksheet('Main')
-
-                                # Push to Google Sheet
-                                worksheet1.update([updated_df.columns.values.tolist()] + updated_df.values.tolist())
-
-                                # Clear cache to refresh data
-                                load_main_sheet.clear()  # only the sheet just written, not every cached loader
-                                
-                                st.success("✅ Request marked as completed.")
-                                time.sleep(2)
-                                st.rerun()
-
-                            except Exception as e:
-                                st.error(f"Error updating Google Sheets: {str(e)}")
-
-                    # --- Submit button styling (CSS injection)
-                    st.markdown("""
-                        <style>
-                        .stButton > button {
-                            width: 100%;
-                            background-color: #cdb4db;
-                            color: black;
-                            font-weight: 600;
-                            border-radius: 8px;
-                            padding: 0.6em;
-                            margin-top: 1em;
-                        }
-                        </style>
-                    """, unsafe_allow_html=True)
-
+                # Staff ticket completion and post-completion survey invitations.
+                render_ta_completion_form(staff_df, df, staff_name, user_email)
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 # --- Section: View Completed Requests (Staff)
