@@ -1017,7 +1017,7 @@ def _ta_dispatch_survey(ticket_id):
 
 def render_ta_phases(df_main, provider_name):
     """Persistent phase editor based on the demo design (not session-state mock data)."""
-    with st.expander('📈 PHASES & PROGRESS TRACKING'):
+    with st.expander('📈 **PHASES & PROGRESS TRACKING**'):
         assigned = df_main.loc[
             (df_main['Assigned Coach'].astype(str).str.strip() == str(provider_name).strip())
             & (df_main['Status'].astype(str).str.strip().isin(['In Progress', 'Completed']))
@@ -1144,7 +1144,7 @@ def render_ta_progress_overview(df_main):
 
 def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
     """Ticket closure with optional hours and recipient-driven survey invitations."""
-    with st.expander('✅ MARK REQUESTS AS COMPLETED'):
+    with st.expander('✅ **MARK REQUESTS AS COMPLETED**'):
         if staff_df.empty:
             st.info('No in-progress tickets to complete.')
         else:
@@ -7786,7 +7786,7 @@ GU-TAP System
 
                 style_metric_cards(border_left_color="#DBF227")
 
-                with st.expander("🔎 **TA log lookup**", expanded=False):
+                with st.expander("🔎 **TA LOG LOOKUP**", expanded=False):
                     st.markdown(
                         """
                         <div class="gutap-hero">
@@ -7850,6 +7850,8 @@ GU-TAP System
                         st.caption(
                             f"Showing {len(_staff_filt)} row(s). Refine the search to narrow results; data is read-only."
                         )
+
+                st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 # --- Section 2: Filter, Sort, Comment
                 with st.expander("🚧 **IN-PROGRESS REQUESTS**"):
