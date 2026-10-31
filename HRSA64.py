@@ -915,9 +915,26 @@ def _ta_percentage(value):
         return 0
 
 
+def _ta_is_completed(status):
+    """Completed tickets have a permanently read-only phase/progress view."""
+    return str(status or '').strip().casefold() == 'completed'
+
+
+def _ta_assert_ticket_editable(ticket_id, record=None):
+    """Check the live Main worksheet before every phase or progress write.
+
+    This also protects against an older browser tab attempting an edit after
+    another TA provider has marked the ticket as Completed.
+    """
+    record = record if record is not None else _ta_main_row(ticket_id)[3]
+    if _ta_is_completed(record.get('Status', '')):
+        raise ValueError('This ticket is completed. Progress and phases are read-only.')
+    return record
+
+
 def _ta_save_overall_progress(ticket_id, percent, note, updated_by):
     percent = _ta_percentage(percent)
-    previous = _ta_main_row(ticket_id)[3]
+    previous = _ta_assert_ticket_editable(ticket_id)
     old_pct = str(previous.get('Overall Progress (%)', '')).strip()
     old_note = str(previous.get('Progress Note', '')).strip()
     if old_pct == str(percent) and old_note == (note or '').strip():
@@ -943,6 +960,7 @@ def _ta_save_phase(ticket_id, phase_id, name, status, start_date, target_date, p
     ticket_id = str(ticket_id).strip()
     if not ticket_id or not str(name).strip():
         raise ValueError('A ticket and phase name are required.')
+    _ta_assert_ticket_editable(ticket_id)
     if status not in TA_PHASE_STATUSES:
         raise ValueError('Choose a valid phase status.')
     # Every phase must have a start date. Existing historical blank dates are
@@ -981,6 +999,7 @@ def _ta_save_phase(ticket_id, phase_id, name, status, start_date, target_date, p
 
 
 def _ta_delete_phase(ticket_id, phase_id):
+    _ta_assert_ticket_editable(ticket_id)
     ws = _ta_sheet(TA_PHASE_SHEET, TA_PHASE_COLUMNS)
     matches = [(i + 2, r) for i, r in enumerate(ws.get_all_records(default_blank=''))
                if str(r.get('Phase ID', '')).strip() == str(phase_id).strip()
@@ -1136,9 +1155,18 @@ def _ta_progress_history_chart(ticket_id):
 
 
 def render_ta_phases(df_main, provider_name):
-    """Visual, persistent phase and progress editor for assigned TA tickets."""
+    """Editable tracker for active tickets; collapsed read-only archive when completed."""
+    # The ticket selector is inside the parent expander. Look up its persisted
+    # selection before rendering the expander so a completed ticket stays closed
+    # by default, even if an earlier save requested that the panel reopen.
+    chosen_id = str(st.session_state.get('ta_phase_ticket', '') or '').strip()
+    completed_selection = bool(chosen_id) and bool((
+        df_main['Ticket ID'].astype(str).str.strip().eq(chosen_id)
+        & df_main['Assigned Coach'].astype(str).str.strip().eq(str(provider_name).strip())
+        & df_main['Status'].map(_ta_is_completed)
+    ).any())
     with st.expander('📈 **PHASES & PROGRESS TRACKING**',
-                     expanded=bool(st.session_state.get('ta_progress_keep_open', False))):
+                     expanded=bool(st.session_state.get('ta_progress_keep_open', False)) and not completed_selection):
         assigned = df_main.loc[
             (df_main['Assigned Coach'].astype(str).str.strip() == str(provider_name).strip())
             & (df_main['Status'].astype(str).str.strip().isin(['In Progress', 'Completed']))
@@ -1148,12 +1176,24 @@ def render_ta_phases(df_main, provider_name):
             st.info('No assigned tickets available for progress tracking.')
             return
 
-        st.markdown('Track the work completed on each TA ticket, update progress, and manage project phases.')
-        ticket_id = st.selectbox('TA ticket', ids, key='ta_phase_ticket',
-            format_func=lambda x: f'{x} · ' + str(assigned.loc[
-                assigned['Ticket ID'].astype(str).str.strip().eq(x), 'Jurisdiction'
-            ].iloc[0]) if 'Jurisdiction' in assigned.columns else x)
+        st.markdown('Track active TA tickets or review completed tickets in read-only mode.')
+
+        def ticket_label(value):
+            match = assigned.loc[assigned['Ticket ID'].astype(str).str.strip().eq(value)]
+            if match.empty:
+                return str(value)
+            row = match.iloc[0]
+            label = str(value)
+            if 'Jurisdiction' in assigned.columns:
+                label += f' · {row.get("Jurisdiction", "")}'
+            label += ' · 🔒 Completed (view only)' if _ta_is_completed(row.get('Status')) else ' · In progress'
+            return label
+
+        ticket_id = st.selectbox('TA ticket', ids, key='ta_phase_ticket', format_func=ticket_label)
         current = assigned[assigned['Ticket ID'].astype(str).str.strip() == ticket_id].iloc[0]
+        is_completed = _ta_is_completed(current.get('Status', ''))
+        if is_completed:
+            st.info('🔒 This ticket has been completed. Its recorded phases, notes, and progress are now view-only; no changes can be saved.')
         assigned_date_raw = current.get('Assigned Date', '')
         assigned_date = _ta_phase_default_date(assigned_date_raw, datetime.now().date())
         has_assigned_date = pd.notna(pd.to_datetime(assigned_date_raw, errors='coerce'))
@@ -1195,6 +1235,46 @@ def render_ta_phases(df_main, provider_name):
                    f'  |  Ticket assigned: {assigned_date.strftime("%b %d, %Y") if has_assigned_date else "Date not recorded"}')
         if current_note:
             st.info(f'Latest progress note: {current_note}', icon='📝')
+
+        if is_completed:
+            # Keep the completed record compact. Expand this view-only control
+            # to inspect phases and progress history; never create edit widgets.
+            closed_at = pd.to_datetime(current.get('Close Date', ''), errors='coerce')
+            if pd.notna(closed_at):
+                st.caption(f'Ticket completed: {closed_at.strftime("%b %d, %Y")} · Archived tracking (read-only)')
+            if st.checkbox('👁️ View saved phases and progress history (read-only)',
+                           value=False, key=f'ta_completed_phase_details_{ticket_id}'):
+                if phases:
+                    st.markdown('#### Saved phase completion')
+                    _ta_phase_progress_chart(phases)
+                    st.markdown('#### Saved phases')
+                    status_icons = {'Not started': '⚪', 'In progress': '🔵',
+                                    'Blocked': '🟠', 'Complete': '✅'}
+                    for position, phase in enumerate(phases, start=1):
+                        phase_name = str(phase.get('Phase Name', '') or 'Untitled phase').strip()
+                        phase_status = str(phase.get('Status', '') or 'Not started').strip()
+                        phase_pct = _ta_phase_effective_progress(phase_status, phase.get('Progress (%)', 0))
+                        phase_start = pd.to_datetime(phase.get('Start Date', ''), errors='coerce')
+                        phase_target = pd.to_datetime(phase.get('Target Date', ''), errors='coerce')
+                        phase_last = _ta_display_timestamp(phase.get('Updated At', ''))
+                        phase_actor = str(phase.get('Updated By', '') or '').strip()
+                        phase_notes = str(phase.get('Notes', '') or '').strip()
+                        with st.container(border=True):
+                            st.markdown(f'**{position}. {html.escape(phase_name)}**')
+                            st.caption(f'{status_icons.get(phase_status, "◻️")} {phase_status} · {phase_pct}% complete')
+                            st.progress(phase_pct / 100)
+                            st.caption('Start: ' + (phase_start.strftime('%b %d, %Y') if pd.notna(phase_start) else 'Not recorded')
+                                       + '  ·  Target: ' + (phase_target.strftime('%b %d, %Y') if pd.notna(phase_target) else 'Not set'))
+                            st.caption(f'Last updated: {phase_last}'
+                                       + (f' · By {phase_actor}' if phase_actor and phase_actor.casefold() not in ('nan', 'none') else ''))
+                            if phase_notes and phase_notes.casefold() not in ('nan', 'none'):
+                                st.markdown('**Notes:** ' + html.escape(phase_notes))
+                else:
+                    st.info('No phases were recorded before this ticket was completed.')
+                if st.checkbox('Show overall progress history', value=False,
+                               key=f'ta_completed_history_{ticket_id}'):
+                    _ta_progress_history_chart(ticket_id)
+            return
 
         with st.container(border=True):
             st.markdown('#### Update overall progress')
@@ -1443,6 +1523,9 @@ def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
                     placeholder='alex@example.com, jamie@example.com',
                     help='Separate multiple addresses with commas, semicolons, or new lines. Spaces after separators are optional.',
                 )
+                st.caption('Separate emails with a comma, semicolon, or new line (spaces optional). '
+                           'Each selected recipient receives an individual email, not a group CC.')
+                st.caption(f'Survey email subject: {_ta_survey_subject(ticket_id)}')
                 submitted = st.form_submit_button('Mark as completed', type='primary')
             if submitted:
                 try:
