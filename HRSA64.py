@@ -3,7 +3,7 @@ import re
 import pandas as pd
 from millify import millify # shortens values (10_000 ---> 10k)
 from streamlit_extras.metric_cards import style_metric_cards # beautify metric card with css
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import altair as alt
@@ -873,8 +873,36 @@ def _ta_write_ticket_fields(ticket_id, values):
     load_main_sheet.clear()
 
 
+# User-requested fixed Eastern Standard Time (EST, UTC-05:00). This is a fixed
+# standard-time clock rather than America/New_York's seasonal EDT/EST clock.
+_TA_EST = timezone(timedelta(hours=-5), name='EST')
+
+
 def _ta_timestamp():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    """Write unambiguous UTC timestamps going forward (readers convert to EST)."""
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def _ta_timestamp_in_est(value):
+    """Convert a saved timestamp to fixed EST. Old naive sheet values assumed UTC.
+
+    Older rows were saved using the host's local datetime.now() without a zone.
+    UTC is the normal Streamlit Cloud host setting; older timestamps from other
+    host time zones cannot be accurately recovered without a known origin zone.
+    """
+    if value is None or not str(value).strip() or str(value).strip().lower() in ('nan','none','nat'):
+        return None
+    parsed = pd.to_datetime(value, errors='coerce', utc=True)
+    return parsed.tz_convert(_TA_EST) if pd.notna(parsed) else None
+
+
+def _ta_phase_effective_progress(status, percent):
+    """Keep phase percentages consistent with the selected milestone status."""
+    if str(status or '').strip() == 'Not started':
+        return 0
+    if str(status or '').strip() == 'Complete':
+        return 100
+    return _ta_percentage(percent)
 
 
 def _ta_percentage(value):
@@ -930,9 +958,7 @@ def _ta_save_phase(ticket_id, phase_id, name, status, start_date, target_date, p
         if valid_target.date() < valid_start.date():
             raise ValueError('Target date cannot be before the start date.')
         target_date = valid_target.strftime('%Y-%m-%d')
-    percent = _ta_percentage(percent)
-    if status == 'Complete':
-        percent = 100
+    percent = _ta_phase_effective_progress(status, percent)
     now = _ta_timestamp()
     ws = _ta_sheet(TA_PHASE_SHEET, TA_PHASE_COLUMNS)
     headers = ws.row_values(1)
@@ -1029,9 +1055,11 @@ def _ta_dispatch_survey(ticket_id):
 
 
 def _ta_display_timestamp(value):
-    """Friendly date/time in the phase tracker; blank historical values are safe."""
-    parsed = pd.to_datetime(value, errors='coerce')
-    return parsed.strftime('%b %d, %Y at %I:%M %p').replace(' 0', ' ') if pd.notna(parsed) else 'Not updated yet'
+    """Show a timezone-explicit date/time in fixed EST (UTC-05:00)."""
+    parsed = _ta_timestamp_in_est(value)
+    if parsed is None:
+        return 'Not updated yet'
+    return parsed.strftime('%b %d, %Y at %I:%M %p').replace(' 0', ' ') + ' · EST'
 
 
 def _ta_phase_default_date(value, fallback):
@@ -1056,7 +1084,7 @@ def _ta_phase_progress_chart(phases):
     for index, phase in enumerate(phases, start=1):
         rows.append({
             'Phase': f'{index}. {str(phase.get("Phase Name", "") or "Untitled phase").strip()}',
-            'Completion': _ta_percentage(phase.get('Progress (%)', 0)),
+            'Completion': _ta_phase_effective_progress(phase.get('Status'), phase.get('Progress (%)', 0)),
             'Status': str(phase.get('Status', 'Not started') or 'Not started'),
             'Start date': str(phase.get('Start Date', '') or '—'),
             'Target date': str(phase.get('Target Date', '') or '—'),
@@ -1083,18 +1111,18 @@ def _ta_progress_history_chart(ticket_id):
     if len(entries) < 2:
         return
     history = pd.DataFrame(entries)
-    history['Updated At'] = pd.to_datetime(history['Updated At'], errors='coerce')
+    history['Updated At'] = history['Updated At'].map(lambda val: _ta_timestamp_in_est(val).tz_localize(None) if _ta_timestamp_in_est(val) is not None else pd.NaT)
     history['Overall Progress (%)'] = pd.to_numeric(history['Overall Progress (%)'], errors='coerce')
     history = history.dropna(subset=['Updated At', 'Overall Progress (%)']).sort_values('Updated At')
     if len(history) < 2:
         return
     # Do not aggregate same-date updates: a timestamp distinguishes each revision.
-    st.caption('Overall progress history')
+    st.caption('Overall progress history · All timestamps are in EST (UTC−5)')
     base = alt.Chart(history)
     line = base.mark_line(point=True, strokeWidth=3, color='#2563eb').encode(
-        x=alt.X('Updated At:T', title=None),
+        x=alt.X('Updated At:T', title='Updated (EST)'),
         y=alt.Y('Overall Progress (%):Q', title='Completion (%)', scale=alt.Scale(domain=[0, 100])),
-        tooltip=[alt.Tooltip('Updated At:T', title='Updated'),
+        tooltip=[alt.Tooltip('Updated At:T', title='Updated (EST)'),
                  alt.Tooltip('Overall Progress (%):Q', title='Progress'),
                  alt.Tooltip('Progress Note:N', title='Note'),
                  alt.Tooltip('Updated By:N', title='Updated by')],
@@ -1174,7 +1202,7 @@ def render_ta_phases(df_main, provider_name):
                     try:
                         changed = _ta_save_overall_progress(ticket_id, percentage, note, provider_name)
                         _ta_progress_flash(ticket_id,
-                            'Overall progress saved successfully. The latest update is shown above.' if changed
+                            f'Overall progress saved successfully to Google Sheets at {_ta_display_timestamp(_ta_timestamp())}. The latest update is shown above.' if changed
                             else 'No changes to save. Your overall progress is already up to date.',
                             'success' if changed else 'info')
                         st.rerun()
@@ -1199,7 +1227,7 @@ def render_ta_phases(df_main, provider_name):
             phase_id = str(phase.get('Phase ID', '')).strip()
             phase_name = str(phase.get('Phase Name', '') or 'Untitled phase').strip()
             phase_status = str(phase.get('Status', 'Not started') or 'Not started')
-            phase_pct = _ta_percentage(phase.get('Progress (%)', 0))
+            phase_pct = _ta_phase_effective_progress(phase_status, phase.get('Progress (%)', 0))
             phase_start_raw = phase.get('Start Date', '')
             phase_target_raw = phase.get('Target Date', '')
             phase_start = _ta_phase_default_date(phase_start_raw, assigned_date)
@@ -1233,11 +1261,24 @@ def render_ta_phases(df_main, provider_name):
                 if st.session_state.get(edit_key, False):
                     st.divider()
                     st.markdown('**Edit phase details**')
+                    revised_status = st.selectbox('Phase status', list(TA_PHASE_STATUSES),
+                        index=list(TA_PHASE_STATUSES).index(phase_status) if phase_status in TA_PHASE_STATUSES else 0,
+                        key=f'ta_edit_phase_status_{phase_id}',
+                        help='Not started automatically means 0%; Complete automatically means 100%. Save changes to apply.')
                     with st.form(f'ta_edit_phase_{phase_id}'):
                         revised_name = st.text_input('Phase name *', value=phase_name)
-                        revised_status = st.selectbox('Phase status', list(TA_PHASE_STATUSES),
-                            index=list(TA_PHASE_STATUSES).index(phase_status) if phase_status in TA_PHASE_STATUSES else 0)
-                        revised_percent = st.slider('Phase completion (%)', 0, 100, phase_pct, step=5)
+                        # Status is outside the form: Streamlit forms do not rerun when
+                        # the selectbox changes, so a conditional slider would remain
+                        # visible until Save unless we put the status selector outside.
+                        if revised_status == 'Not started':
+                            revised_percent = 0
+                            st.caption('Completion: **0%** · Automatically set for Not started.')
+                        elif revised_status == 'Complete':
+                            revised_percent = 100
+                            st.caption('Completion: **100%** · Automatically set for Complete.')
+                        else:
+                            revised_percent = st.slider('Phase completion (%)', 0, 100, phase_pct, step=5,
+                                key=f'ta_edit_phase_pct_{phase_id}')
                         date_left, date_right = st.columns(2)
                         with date_left:
                             revised_start = st.date_input('Start date *', value=phase_start,
@@ -1252,7 +1293,7 @@ def render_ta_phases(df_main, provider_name):
                                 _ta_save_phase(ticket_id, phase_id, revised_name, revised_status,
                                     revised_start, revised_target if use_target else '',
                                     revised_percent, revised_notes, provider_name)
-                                _ta_progress_flash(ticket_id, f'Changes to “{revised_name.strip()}” were saved successfully.')
+                                _ta_progress_flash(ticket_id, f'Changes to “{revised_name.strip()}” were saved successfully at {_ta_display_timestamp(_ta_timestamp())}.')
                                 st.session_state[edit_key] = False
                                 st.rerun()
                             except Exception as ex:
@@ -1264,7 +1305,7 @@ def render_ta_phases(df_main, provider_name):
                         try:
                             _ta_delete_phase(ticket_id, phase_id)
                             st.session_state[edit_key] = False
-                            _ta_progress_flash(ticket_id, f'“{phase_name}” was deleted.')
+                            _ta_progress_flash(ticket_id, f'“{phase_name}” was deleted successfully at {_ta_display_timestamp(_ta_timestamp())}.')
                             st.rerun()
                         except Exception as ex:
                             st.error(f'Unable to delete phase: {ex}')
@@ -1275,10 +1316,23 @@ def render_ta_phases(df_main, provider_name):
             st.caption('Enter a phase name, choose a status, and set its dates. The start date is required and initially uses the ticket assignment date.')
             if not has_assigned_date:
                 st.caption('This ticket has no recorded assignment date, so the start date defaults to today. You can change it.')
-            with st.form(f'ta_new_phase_{ticket_id}', clear_on_submit=False):
+            # Keep status outside the form so the progress slider immediately
+            # appears/disappears as the TA provider chooses a status.
+            new_status_key = f'ta_new_phase_status_{ticket_id}'
+            new_status = st.selectbox('Phase status', TA_PHASE_STATUSES,
+                key=new_status_key,
+                help='Not started automatically means 0%; Complete automatically means 100%.')
+            with st.form(f'ta_new_phase_{ticket_id}', clear_on_submit=True):
                 new_name = st.text_input('Phase name *', placeholder='e.g., Needs assessment, Data analysis, Implementation')
-                new_status = st.selectbox('Phase status', TA_PHASE_STATUSES)
-                new_progress = st.slider('Phase completion (%)', 0, 100, 0, step=5)
+                if new_status == 'Not started':
+                    new_progress = 0
+                    st.caption('Completion: **0%** · Automatically set for Not started.')
+                elif new_status == 'Complete':
+                    new_progress = 100
+                    st.caption('Completion: **100%** · Automatically set for Complete.')
+                else:
+                    new_progress = st.slider('Phase completion (%)', 0, 100, 0, step=5,
+                        key=f'ta_new_phase_pct_{ticket_id}')
                 date_left, date_right = st.columns(2)
                 with date_left:
                     new_start = st.date_input('Start date *', value=assigned_date,
@@ -1291,7 +1345,7 @@ def render_ta_phases(df_main, provider_name):
                     try:
                         _ta_save_phase(ticket_id, '', new_name, new_status, new_start,
                             new_target, new_progress, new_notes, provider_name)
-                        _ta_progress_flash(ticket_id, f'New phase “{new_name.strip()}” was added and saved successfully.')
+                        _ta_progress_flash(ticket_id, f'New phase “{new_name.strip()}” was added and saved successfully at {_ta_display_timestamp(_ta_timestamp())}.')
                         st.rerun()
                     except Exception as ex:
                         st.error(f'Unable to add phase: {ex}')
