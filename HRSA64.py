@@ -1005,6 +1005,11 @@ def _ta_parse_emails(text):
     return list(dict.fromkeys(values))
 
 
+def _ta_survey_subject(ticket_id):
+    """Consistent email subject for all TA ticket survey invitations."""
+    return f'GU-TAP feedback survey — {str(ticket_id).strip()}'
+
+
 def _ta_survey_body(ticket_id):
     return (
         'Hello,\n\n'
@@ -1034,7 +1039,7 @@ def _ta_dispatch_survey(ticket_id):
         if email in already:
             continue
         try:
-            ok = send_email_mailjet(email, f'GU-TAP feedback survey — {ticket_id}', _ta_survey_body(ticket_id))
+            ok = send_email_mailjet(email, _ta_survey_subject(ticket_id), _ta_survey_body(ticket_id))
         except Exception:
             ok = False
         if ok:
@@ -1351,9 +1356,72 @@ def render_ta_phases(df_main, provider_name):
                         st.error(f'Unable to add phase: {ex}')
 
 
+def _ta_survey_delivery_snapshot(ticket_id, previously_sent=()):
+    """Read persisted delivery results; only claim a send when the sheet confirms it.
+
+    Already-sent addresses are excluded from new-send confirmations during retries.
+    """
+    record = _ta_main_row(ticket_id)[3]
+    recipients = _ta_parse_emails(record.get('Survey Recipients', ''))
+    sent_to = _ta_parse_emails(record.get('Survey Sent To', ''))
+    sent_set = set(sent_to)
+    previous_set = {str(address).strip().lower() for address in previously_sent}
+    return {
+        'recipients': recipients,
+        'sent_now': [address for address in recipients if address in sent_set and address not in previous_set],
+        'already_sent': [address for address in recipients if address in sent_set and address in previous_set],
+        'pending': [address for address in recipients if address not in sent_set],
+        'status': str(record.get('Survey Status', '') or '').strip(),
+    }
+
+
+def _ta_completion_flash(ticket_id, *, completed=False, snapshot=None, error=''):
+    """Persist ticket/email confirmation for display after Streamlit's st.rerun()."""
+    st.session_state['ta_completion_keep_open'] = True
+    st.session_state['ta_completion_confirmation'] = {
+        'ticket_id': str(ticket_id),
+        'completed': bool(completed),
+        'survey': snapshot,
+        'error': str(error or ''),
+    }
+
+
+def _ta_show_completion_confirmation():
+    """Show truthful, recipient-specific save/sending messages after a rerun."""
+    notice = st.session_state.pop('ta_completion_confirmation', None)
+    if not notice:
+        return
+    ticket_id = notice['ticket_id']
+    if notice.get('completed'):
+        st.success(f'Ticket {ticket_id} marked as completed. Saved successfully to Google Sheets.', icon='✅')
+    snapshot = notice.get('survey')
+    if snapshot:
+        sent_now = snapshot.get('sent_now') or []
+        already_sent = snapshot.get('already_sent') or []
+        pending = snapshot.get('pending') or []
+        status = snapshot.get('status', '')
+        if sent_now:
+            st.success(f'Survey email sent successfully to: {", ".join(sent_now)}', icon='✅')
+        if already_sent:
+            st.info(f'Previously sent to (not resent): {", ".join(already_sent)}', icon='ℹ️')
+        if pending:
+            addresses = ', '.join(pending)
+            if status == 'Pending survey link':
+                st.info('Survey recipients saved, but no emails were sent because the survey link is not configured. '
+                        f'Pending: {addresses}', icon='ℹ️')
+            else:
+                st.warning(f'Survey email not sent to: {addresses}. You can retry from Pending survey invitations.', icon='⚠️')
+        elif not snapshot.get('recipients'):
+            st.info('No survey recipients selected; no survey emails were sent.', icon='ℹ️')
+    if notice.get('error'):
+        st.warning(f'The ticket update was saved, but survey processing needs attention: {notice["error"]}', icon='⚠️')
+
+
 def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
-    """Ticket closure with optional hours and recipient-driven survey invitations."""
-    with st.expander('✅ **MARK REQUESTS AS COMPLETED**'):
+    """Ticket closure with optional hours and recipient-specific survey confirmation."""
+    expanded = bool(st.session_state.pop('ta_completion_keep_open', False))
+    with st.expander('✅ **MARK REQUESTS AS COMPLETED**', expanded=expanded):
+        _ta_show_completion_confirmation()
         if staff_df.empty:
             st.info('No in-progress tickets to complete.')
         else:
@@ -1370,8 +1438,14 @@ def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
                 st.markdown('**Survey recipients**')
                 include_requester = st.checkbox('Requester', value=True)
                 include_provider = st.checkbox('TA provider', value=False)
-                other_recipients = st.text_area('Other participants (email addresses)',
-                    placeholder='One or more emails, separated by commas or semicolons')
+                other_recipients = st.text_area(
+                    'Other participants — email addresses (optional)',
+                    placeholder='alex@example.com, jamie@example.com',
+                    help='Separate multiple addresses with commas, semicolons, or new lines. Spaces after separators are optional.',
+                )
+                st.caption('Separate emails with a comma, semicolon, or new line (spaces optional). '
+                           'Each selected recipient receives an individual email, not a group CC.')
+                st.caption(f'Survey email subject: {_ta_survey_subject(ticket_id)}')
                 submitted = st.form_submit_button('Mark as completed', type='primary')
             if submitted:
                 try:
@@ -1404,15 +1478,21 @@ def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
                         'Survey Status': ('Pending' if addresses else 'Not requested'),
                         'Survey Sent To': '', 'Survey Sent At': '',
                     })
-                    sent, failures, message = _ta_dispatch_survey(ticket_id)
-                    st.success('Ticket marked as completed.')
-                    if addresses:
-                        st.info(message if sent == 0 else f'Survey invitations sent to {sent} recipient(s).')
-                    if failures:
-                        st.warning(f'{failures} invitation(s) could not be sent. You can retry below.')
-                    st.rerun()
                 except Exception as ex:
                     st.error(f'Unable to complete this ticket: {ex}')
+                else:
+                    # The ticket is ALREADY completed; survey issues must never
+                    # produce the misleading message 'Unable to complete ticket'.
+                    survey_error = ''
+                    snapshot = None
+                    try:
+                        _ta_dispatch_survey(ticket_id)
+                        snapshot = _ta_survey_delivery_snapshot(ticket_id)
+                    except Exception as ex:
+                        survey_error = str(ex)
+                    _ta_completion_flash(ticket_id, completed=True, snapshot=snapshot,
+                                         error=survey_error)
+                    st.rerun()
         # Allow deferred sends after a survey link is finalized or a delivery fails.
         pending = all_df[
             (all_df['Assigned Coach'].astype(str) == str(staff_name))
@@ -1422,14 +1502,17 @@ def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
         ].copy()
         if not pending.empty:
             st.markdown('#### Pending survey invitations')
-            chosen = st.selectbox('Ticket', pending['Ticket ID'].astype(str).tolist(), key='ta_survey_pending_ticket')
+            chosen = st.selectbox('Ticket', pending['Ticket ID'].astype(str).tolist(),
+                                  key='ta_survey_pending_ticket')
             if st.button('Send pending survey invitations', key='ta_send_pending_survey'):
                 try:
-                    sent, failed, msg = _ta_dispatch_survey(chosen)
-                    st.success(msg if not failed else f'Sent: {sent}. Failed: {failed}.')
+                    before = _ta_parse_emails(_ta_main_row(chosen)[3].get('Survey Sent To', ''))
+                    _ta_dispatch_survey(chosen)
+                    snapshot = _ta_survey_delivery_snapshot(chosen, previously_sent=before)
+                    _ta_completion_flash(chosen, snapshot=snapshot)
                     st.rerun()
                 except Exception as ex:
-                    st.error(f'Unable to send survey invitations: {ex}')
+                    st.error(f'Unable to process survey invitations: {ex}')
 
 
 def _is_quota_error(exc) -> bool:
