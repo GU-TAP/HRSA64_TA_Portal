@@ -917,6 +917,19 @@ def _ta_save_phase(ticket_id, phase_id, name, status, start_date, target_date, p
         raise ValueError('A ticket and phase name are required.')
     if status not in TA_PHASE_STATUSES:
         raise ValueError('Choose a valid phase status.')
+    # Every phase must have a start date. Existing historical blank dates are
+    # preserved on read, but a new/edit save requires the provider to supply one.
+    valid_start = pd.to_datetime(start_date, errors='coerce')
+    if pd.isna(valid_start):
+        raise ValueError('A phase start date is required.')
+    start_date = valid_start.strftime('%Y-%m-%d')
+    if target_date:
+        valid_target = pd.to_datetime(target_date, errors='coerce')
+        if pd.isna(valid_target):
+            raise ValueError('Enter a valid target date.')
+        if valid_target.date() < valid_start.date():
+            raise ValueError('Target date cannot be before the start date.')
+        target_date = valid_target.strftime('%Y-%m-%d')
     percent = _ta_percentage(percent)
     if status == 'Complete':
         percent = 100
@@ -1015,131 +1028,273 @@ def _ta_dispatch_survey(ticket_id):
     return success, failures, 'Survey invitations processed.'
 
 
+def _ta_display_timestamp(value):
+    """Friendly date/time in the phase tracker; blank historical values are safe."""
+    parsed = pd.to_datetime(value, errors='coerce')
+    return parsed.strftime('%b %d, %Y at %I:%M %p').replace(' 0', ' ') if pd.notna(parsed) else 'Not updated yet'
+
+
+def _ta_phase_default_date(value, fallback):
+    """Use a saved/assigned date when available; otherwise return a real date."""
+    parsed = pd.to_datetime(value, errors='coerce')
+    return parsed.date() if pd.notna(parsed) else fallback
+
+
+def _ta_progress_flash(ticket_id, message, level='success'):
+    """Show confirmation AFTER rerun (a normal st.success before rerun disappears)."""
+    st.session_state['ta_progress_keep_open'] = True
+    st.session_state['ta_progress_confirmation'] = {
+        'ticket_id': str(ticket_id), 'message': message, 'level': level,
+    }
+
+
+def _ta_phase_progress_chart(phases):
+    """Visual overview by phase; the Google Sheets records remain unchanged."""
+    if not phases:
+        return
+    rows = []
+    for index, phase in enumerate(phases, start=1):
+        rows.append({
+            'Phase': f'{index}. {str(phase.get("Phase Name", "") or "Untitled phase").strip()}',
+            'Completion': _ta_percentage(phase.get('Progress (%)', 0)),
+            'Status': str(phase.get('Status', 'Not started') or 'Not started'),
+            'Start date': str(phase.get('Start Date', '') or '—'),
+            'Target date': str(phase.get('Target Date', '') or '—'),
+        })
+    data = pd.DataFrame(rows)
+    order = data['Phase'].tolist()
+    chart = alt.Chart(data).mark_bar(size=22, cornerRadiusEnd=6).encode(
+        x=alt.X('Completion:Q', title='Phase completion (%)', scale=alt.Scale(domain=[0, 100])),
+        y=alt.Y('Phase:N', title=None, sort=order, axis=alt.Axis(labelLimit=300)),
+        color=alt.Color('Status:N', title='Phase status', scale=alt.Scale(
+            domain=list(TA_PHASE_STATUSES),
+            range=['#94a3b8', '#2563eb', '#e59a23', '#16a34a'],
+        )),
+        tooltip=['Phase:N', 'Status:N', 'Completion:Q', 'Start date:N', 'Target date:N'],
+    ).properties(height=max(130, min(520, len(rows) * 43 + 35)))
+    st.altair_chart(chart, use_container_width=True)
+
+
+def _ta_progress_history_chart(ticket_id):
+    """Display past overall-progress updates when there is enough history."""
+    history_ws = _ta_sheet(TA_PROGRESS_HISTORY_SHEET, TA_PROGRESS_HISTORY_COLUMNS)
+    entries = [item for item in history_ws.get_all_records(default_blank='')
+               if str(item.get('Ticket ID', '')).strip() == str(ticket_id).strip()]
+    if len(entries) < 2:
+        return
+    history = pd.DataFrame(entries)
+    history['Updated At'] = pd.to_datetime(history['Updated At'], errors='coerce')
+    history['Overall Progress (%)'] = pd.to_numeric(history['Overall Progress (%)'], errors='coerce')
+    history = history.dropna(subset=['Updated At', 'Overall Progress (%)']).sort_values('Updated At')
+    if len(history) < 2:
+        return
+    # Do not aggregate same-date updates: a timestamp distinguishes each revision.
+    st.caption('Overall progress history')
+    base = alt.Chart(history)
+    line = base.mark_line(point=True, strokeWidth=3, color='#2563eb').encode(
+        x=alt.X('Updated At:T', title=None),
+        y=alt.Y('Overall Progress (%):Q', title='Completion (%)', scale=alt.Scale(domain=[0, 100])),
+        tooltip=[alt.Tooltip('Updated At:T', title='Updated'),
+                 alt.Tooltip('Overall Progress (%):Q', title='Progress'),
+                 alt.Tooltip('Progress Note:N', title='Note'),
+                 alt.Tooltip('Updated By:N', title='Updated by')],
+    )
+    st.altair_chart(line.properties(height=190), use_container_width=True)
+
+
 def render_ta_phases(df_main, provider_name):
-    """Persistent phase editor based on the demo design (not session-state mock data)."""
-    with st.expander('📈 **PHASES & PROGRESS TRACKING**'):
+    """Visual, persistent phase and progress editor for assigned TA tickets."""
+    with st.expander('📈 **PHASES & PROGRESS TRACKING**',
+                     expanded=bool(st.session_state.get('ta_progress_keep_open', False))):
         assigned = df_main.loc[
             (df_main['Assigned Coach'].astype(str).str.strip() == str(provider_name).strip())
             & (df_main['Status'].astype(str).str.strip().isin(['In Progress', 'Completed']))
         ]
         ids = assigned['Ticket ID'].dropna().astype(str).str.strip().unique().tolist()
         if not ids:
-            st.info('No assigned tickets available.')
+            st.info('No assigned tickets available for progress tracking.')
             return
-        ticket_id = st.selectbox('Select ticket', ids, key='ta_phase_ticket')
-        current = assigned[assigned['Ticket ID'].astype(str) == ticket_id].iloc[0]
+
+        st.markdown('Track the work completed on each TA ticket, update progress, and manage project phases.')
+        ticket_id = st.selectbox('TA ticket', ids, key='ta_phase_ticket',
+            format_func=lambda x: f'{x} · ' + str(assigned.loc[
+                assigned['Ticket ID'].astype(str).str.strip().eq(x), 'Jurisdiction'
+            ].iloc[0]) if 'Jurisdiction' in assigned.columns else x)
+        current = assigned[assigned['Ticket ID'].astype(str).str.strip() == ticket_id].iloc[0]
+        assigned_date_raw = current.get('Assigned Date', '')
+        assigned_date = _ta_phase_default_date(assigned_date_raw, datetime.now().date())
+        has_assigned_date = pd.notna(pd.to_datetime(assigned_date_raw, errors='coerce'))
         current_pct = _ta_percentage(current.get('Overall Progress (%)', 0))
-        current_note = str(current.get('Progress Note', '') or '')
-        if current_note.lower() == 'nan':
+        current_note = str(current.get('Progress Note', '') or '').strip()
+        if current_note.casefold() in ('nan', 'none'):
             current_note = ''
-        st.progress(current_pct / 100)
-        st.caption(f'Overall progress: {current_pct}%')
-        with st.form(f'ta_overall_form_{ticket_id}'):
-            percentage = st.slider('Overall progress (%)', 0, 100, current_pct, step=5)
-            note = st.text_area('Progress note', value=current_note, help='Summarize the latest accomplishments or blockers.')
-            if st.form_submit_button('Save overall progress'):
-                try:
-                    _ta_save_overall_progress(ticket_id, percentage, note, provider_name)
-                    st.success('Progress saved.')
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f'Unable to save progress: {ex}')
+        last_updated = _ta_display_timestamp(current.get('Progress Updated At', ''))
+        last_by = str(current.get('Progress Updated By', '') or '').strip()
+        if last_by.casefold() in ('nan', 'none'):
+            last_by = ''
+
+        notification = st.session_state.pop('ta_progress_confirmation', None)
+        if notification and notification.get('ticket_id') == ticket_id:
+            message = notification.get('message', '')
+            if notification.get('level') == 'info':
+                st.info(message, icon='ℹ️')
+            else:
+                st.success(message, icon='✅')
+
         phases = _ta_phases(ticket_id)
-        st.markdown('#### Ticket phases')
-        if not phases:
-            st.info('No phases have been added to this ticket.')
-        for p in phases:
-            phase_id = str(p.get('Phase ID', '')).strip()
-            name = str(p.get('Phase Name', ''))
-            status = str(p.get('Status', 'Not started'))
-            percent = _ta_percentage(p.get('Progress (%)', 0))
-            start_str = str(p.get('Start Date', '')).strip()
-            target_str = str(p.get('Target Date', '')).strip()
-            start_dt = pd.to_datetime(start_str, errors='coerce')
-            target_dt = pd.to_datetime(target_str, errors='coerce')
-            st.markdown(f'**{html.escape(name)}** — {html.escape(status)} · {percent}%')
-            st.progress(percent / 100)
-            with st.form(f'ta_edit_phase_{phase_id}'):
-                revised_name = st.text_input('Phase name', value=name)
-                revised_status = st.selectbox('Status', list(TA_PHASE_STATUSES),
-                    index=list(TA_PHASE_STATUSES).index(status) if status in TA_PHASE_STATUSES else 0)
-                revised_percent = st.slider('Progress (%)', 0, 100, percent, step=5)
-                c1, c2 = st.columns(2)
-                with c1:
-                    use_start = st.checkbox('Set start date', value=pd.notna(start_dt))
-                    revised_start = st.date_input('Start date', value=start_dt.date() if pd.notna(start_dt) else datetime.now().date(), disabled=not use_start)
-                with c2:
-                    use_target = st.checkbox('Set target date', value=pd.notna(target_dt))
-                    revised_target = st.date_input('Target date', value=target_dt.date() if pd.notna(target_dt) else datetime.now().date() + timedelta(days=30), disabled=not use_target)
-                revised_notes = st.text_area('Phase notes', value=str(p.get('Notes', '') or ''))
-                if st.form_submit_button('Save phase'):
+        done_count = sum(str(p.get('Status', '')).strip() == 'Complete' for p in phases)
+        blocked_count = sum(str(p.get('Status', '')).strip() == 'Blocked' for p in phases)
+        today = datetime.now().date()
+        overdue_count = sum(
+            str(p.get('Status', '')).strip() != 'Complete' and
+            pd.notna(pd.to_datetime(p.get('Target Date', ''), errors='coerce')) and
+            pd.to_datetime(p.get('Target Date', ''), errors='coerce').date() < today
+            for p in phases
+        )
+        st.markdown('#### Ticket progress at a glance')
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric('Overall progress', f'{current_pct}%')
+        m2.metric('Phases complete', f'{done_count}/{len(phases)}')
+        m3.metric('Blocked phases', blocked_count)
+        m4.metric('Overdue phases', overdue_count)
+        st.progress(current_pct / 100)
+        st.caption(f'Last updated: {last_updated}' + (f' · By {last_by}' if last_by else '') +
+                   f'  |  Ticket assigned: {assigned_date.strftime("%b %d, %Y") if has_assigned_date else "Date not recorded"}')
+        if current_note:
+            st.info(f'Latest progress note: {current_note}', icon='📝')
+
+        with st.container(border=True):
+            st.markdown('#### Update overall progress')
+            st.caption('Set the overall completion percentage manually. It does not automatically change when individual phases are updated.')
+            with st.form(f'ta_overall_form_{ticket_id}'):
+                percentage = st.slider('Overall progress (%)', 0, 100, current_pct, step=5)
+                note = st.text_area('Progress update / milestones', value=current_note,
+                                    placeholder='Summarize completed work, recent developments, or blockers.')
+                if st.form_submit_button('💾 Save overall progress', type='primary'):
                     try:
-                        _ta_save_phase(ticket_id, phase_id, revised_name, revised_status,
-                          revised_start if use_start else '', revised_target if use_target else '',
-                          revised_percent, revised_notes, provider_name)
-                        st.success('Phase saved.')
+                        changed = _ta_save_overall_progress(ticket_id, percentage, note, provider_name)
+                        _ta_progress_flash(ticket_id,
+                            'Overall progress saved successfully. The latest update is shown above.' if changed
+                            else 'No changes to save. Your overall progress is already up to date.',
+                            'success' if changed else 'info')
                         st.rerun()
                     except Exception as ex:
-                        st.error(f'Unable to save phase: {ex}')
-            confirm_delete = st.checkbox('Confirm delete', key=f'ta_delete_check_{phase_id}')
-            if st.button('Delete phase', key=f'ta_delete_button_{phase_id}', disabled=not confirm_delete):
-                try:
-                    _ta_delete_phase(ticket_id, phase_id)
-                    st.success('Phase deleted.')
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f'Unable to delete phase: {ex}')
-        st.markdown('#### Add a phase')
-        with st.form(f'ta_new_phase_{ticket_id}'):
-            new_name = st.text_input('Phase name *')
-            new_status = st.selectbox('Status', TA_PHASE_STATUSES)
-            new_progress = st.slider('Progress (%)', 0, 100, 0, step=5)
-            c1, c2 = st.columns(2)
-            with c1:
-                set_start = st.checkbox('Set start date', value=False)
-                new_start = st.date_input('Start date', value=datetime.now().date(), disabled=not set_start)
-            with c2:
-                new_target = st.date_input('Target date', value=datetime.now().date() + timedelta(days=30))
-            new_notes = st.text_area('Phase notes')
-            if st.form_submit_button('Add phase'):
-                try:
-                    _ta_save_phase(ticket_id, '', new_name, new_status,
-                        new_start if set_start else '', new_target, new_progress, new_notes, provider_name)
-                    st.success('Phase added.')
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f'Unable to add phase: {ex}')
+                        st.error(f'Unable to save overall progress: {ex}')
 
-
-def render_ta_progress_overview(df_main):
-    """Read-only status and phase details for coordinators."""
-    with st.expander('📈 TICKET PROGRESS & PHASES'):
-        active = df_main.loc[df_main['Status'].astype(str).isin(['In Progress', 'Completed'])].copy()
-        if active.empty:
-            st.info('No tickets available.')
-            return
-        ids = active['Ticket ID'].dropna().astype(str).unique().tolist()
-        ticket_id = st.selectbox('Select ticket', ids, key='ta_coord_progress_ticket')
-        ticket = active.loc[active['Ticket ID'].astype(str) == ticket_id].iloc[0]
-        percent = _ta_percentage(ticket.get('Overall Progress (%)', 0))
-        st.markdown(f"**{html.escape(ticket_id)}** · {html.escape(str(ticket.get('Assigned Coach', '')))} · {percent}% complete")
-        st.progress(percent / 100)
-        note = str(ticket.get('Progress Note', '') or '').strip()
-        if note and note.lower() != 'nan':
-            st.write(note)
-        phases = _ta_phases(ticket_id)
         if phases:
-            table = pd.DataFrame(phases)
-            columns = ['Phase Name', 'Status', 'Start Date', 'Target Date', 'Progress (%)', 'Notes', 'Updated At']
-            show_df(table[[col for col in columns if col in table.columns]].reset_index(drop=True))
-        else:
-            st.info('No phases have been added to this ticket.')
-        history_ws = _ta_sheet(TA_PROGRESS_HISTORY_SHEET, TA_PROGRESS_HISTORY_COLUMNS)
-        updates = [r for r in history_ws.get_all_records(default_blank='')
-                   if str(r.get('Ticket ID', '')).strip() == ticket_id]
-        if updates:
-            st.markdown('#### Recent progress updates')
-            show_df(pd.DataFrame(updates).tail(20).iloc[::-1].reset_index(drop=True))
+            st.markdown('#### Phase completion overview')
+            _ta_phase_progress_chart(phases)
+        if st.checkbox('Show overall progress history', value=False,
+                       key=f'ta_show_progress_history_{ticket_id}'):
+            _ta_progress_history_chart(ticket_id)
+
+        st.markdown('#### Manage ticket phases')
+        st.caption('Select **Edit phase** to update a milestone, its dates, or its notes. Changes are saved only when you press Save phase changes.')
+        if not phases:
+            st.info('No phases yet. Create your first phase using the form below.')
+
+        status_icons = {'Not started': '⚪', 'In progress': '🔵',
+                        'Blocked': '🟠', 'Complete': '✅'}
+        for position, phase in enumerate(phases, start=1):
+            phase_id = str(phase.get('Phase ID', '')).strip()
+            phase_name = str(phase.get('Phase Name', '') or 'Untitled phase').strip()
+            phase_status = str(phase.get('Status', 'Not started') or 'Not started')
+            phase_pct = _ta_percentage(phase.get('Progress (%)', 0))
+            phase_start_raw = phase.get('Start Date', '')
+            phase_target_raw = phase.get('Target Date', '')
+            phase_start = _ta_phase_default_date(phase_start_raw, assigned_date)
+            phase_target = _ta_phase_default_date(phase_target_raw, phase_start + timedelta(days=30))
+            phase_target_exists = pd.notna(pd.to_datetime(phase_target_raw, errors='coerce'))
+            phase_last = _ta_display_timestamp(phase.get('Updated At', ''))
+            phase_actor = str(phase.get('Updated By', '') or '').strip()
+            if phase_actor.casefold() in ('nan', 'none'):
+                phase_actor = ''
+            edit_key = f'ta_phase_edit_visible_{phase_id}'
+
+            with st.container(border=True):
+                heading, action = st.columns([4, 1])
+                with heading:
+                    st.markdown(f'**{position}. {html.escape(phase_name)}**')
+                    st.caption(f'{status_icons.get(phase_status, "◻️")} {phase_status} · {phase_pct}% complete')
+                with action:
+                    if st.button('Edit phase' if not st.session_state.get(edit_key, False) else 'Close editor',
+                                 key=f'ta_phase_toggle_{phase_id}', use_container_width=True):
+                        st.session_state[edit_key] = not st.session_state.get(edit_key, False)
+                        st.session_state['ta_progress_keep_open'] = True
+                        st.rerun()
+                st.progress(phase_pct / 100)
+                c_start, c_target, c_updated = st.columns(3)
+                c_start.caption(f'**Start date**  {phase_start.strftime("%b %d, %Y") if pd.notna(pd.to_datetime(phase_start_raw, errors="coerce")) else "Not recorded"}')
+                c_target.caption(f'**Target date**  {phase_target.strftime("%b %d, %Y") if phase_target_exists else "Not set"}')
+                c_updated.caption(f'**Last updated**  {phase_last}' + (f' · {phase_actor}' if phase_actor else ''))
+                phase_notes = str(phase.get('Notes', '') or '').strip()
+                if phase_notes and phase_notes.casefold() not in ('nan', 'none'):
+                    st.caption('**Notes:** ' + phase_notes)
+                if st.session_state.get(edit_key, False):
+                    st.divider()
+                    st.markdown('**Edit phase details**')
+                    with st.form(f'ta_edit_phase_{phase_id}'):
+                        revised_name = st.text_input('Phase name *', value=phase_name)
+                        revised_status = st.selectbox('Phase status', list(TA_PHASE_STATUSES),
+                            index=list(TA_PHASE_STATUSES).index(phase_status) if phase_status in TA_PHASE_STATUSES else 0)
+                        revised_percent = st.slider('Phase completion (%)', 0, 100, phase_pct, step=5)
+                        date_left, date_right = st.columns(2)
+                        with date_left:
+                            revised_start = st.date_input('Start date *', value=phase_start,
+                                help='Required. Defaults to the ticket assignment date if previously blank.')
+                        with date_right:
+                            use_target = st.checkbox('Set target date', value=phase_target_exists)
+                            revised_target = st.date_input('Target date', value=phase_target, disabled=not use_target)
+                        revised_notes = st.text_area('Phase notes', value=phase_notes,
+                            placeholder='Describe progress, accomplishments, or blockers.')
+                        if st.form_submit_button('💾 Save phase changes', type='primary'):
+                            try:
+                                _ta_save_phase(ticket_id, phase_id, revised_name, revised_status,
+                                    revised_start, revised_target if use_target else '',
+                                    revised_percent, revised_notes, provider_name)
+                                _ta_progress_flash(ticket_id, f'Changes to “{revised_name.strip()}” were saved successfully.')
+                                st.session_state[edit_key] = False
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f'Unable to save phase: {ex}')
+                    confirm_delete = st.checkbox('I understand this phase will be permanently deleted',
+                                                 key=f'ta_delete_check_{phase_id}')
+                    if st.button('Delete this phase', key=f'ta_delete_button_{phase_id}',
+                                 disabled=not confirm_delete):
+                        try:
+                            _ta_delete_phase(ticket_id, phase_id)
+                            st.session_state[edit_key] = False
+                            _ta_progress_flash(ticket_id, f'“{phase_name}” was deleted.')
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f'Unable to delete phase: {ex}')
+
+        st.markdown('#### ➕ Add a new phase')
+        with st.container(border=True):
+            st.markdown('**Create a project milestone**')
+            st.caption('Enter a phase name, choose a status, and set its dates. The start date is required and initially uses the ticket assignment date.')
+            if not has_assigned_date:
+                st.caption('This ticket has no recorded assignment date, so the start date defaults to today. You can change it.')
+            with st.form(f'ta_new_phase_{ticket_id}', clear_on_submit=False):
+                new_name = st.text_input('Phase name *', placeholder='e.g., Needs assessment, Data analysis, Implementation')
+                new_status = st.selectbox('Phase status', TA_PHASE_STATUSES)
+                new_progress = st.slider('Phase completion (%)', 0, 100, 0, step=5)
+                date_left, date_right = st.columns(2)
+                with date_left:
+                    new_start = st.date_input('Start date *', value=assigned_date,
+                        help='Required. Defaults to the ticket assignment date; you can adjust it.')
+                with date_right:
+                    new_target = st.date_input('Target date', value=assigned_date + timedelta(days=30))
+                new_notes = st.text_area('Phase notes (optional)',
+                    placeholder='Key tasks, expected outputs, or current progress')
+                if st.form_submit_button('➕ Add and save phase', type='primary'):
+                    try:
+                        _ta_save_phase(ticket_id, '', new_name, new_status, new_start,
+                            new_target, new_progress, new_notes, provider_name)
+                        _ta_progress_flash(ticket_id, f'New phase “{new_name.strip()}” was added and saved successfully.')
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f'Unable to add phase: {ex}')
 
 
 def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
@@ -7740,7 +7895,6 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                render_ta_progress_overview(df)
 
             elif st.session_state.role == "Assignee/Staff":
                 # Add staff content here
