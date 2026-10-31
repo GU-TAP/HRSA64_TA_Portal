@@ -1443,9 +1443,6 @@ def render_ta_completion_form(staff_df, all_df, staff_name, staff_email):
                     placeholder='alex@example.com, jamie@example.com',
                     help='Separate multiple addresses with commas, semicolons, or new lines. Spaces after separators are optional.',
                 )
-                st.caption('Separate emails with a comma, semicolon, or new line (spaces optional). '
-                           'Each selected recipient receives an individual email, not a group CC.')
-                st.caption(f'Survey email subject: {_ta_survey_subject(ticket_id)}')
                 submitted = st.form_submit_button('Mark as completed', type='primary')
             if submitted:
                 try:
