@@ -48,6 +48,8 @@ CANONICAL_JURISDICTIONS = [
     "Travis Co. - Texas", "King Co. - Washington", "San Juan Municipio - Puerto Rico",
     "Washington, DC", "Alabama", "Arkansas", "Kentucky", "Mississippi", "Missouri",
     "Oklahoma", "South Carolina",
+    # A separately tracked statewide TA unit; county-level Ohio records stay separate.
+    "Ohio (OH)",
 ]
 
 # Places the program serves as part of a larger EHE jurisdiction. The Washington, DC
@@ -59,10 +61,29 @@ JURISDICTION_ROLLUP = {
     "Montgomery Co. - Maryland": "Washington, DC",
 }
 
-# The jurisdictions the "Jurisdictions engaged" total counts: the EHE list above after the
-# roll-up. Anything else (e.g. "Ohio (OH)", a statewide health-department ticket whose
-# counties are already counted) stays visible in tables and filters but is not counted.
+# Count the list above after jurisdiction roll-ups. Ohio (OH) is a separate
+# program-reporting jurisdiction (in addition to the named Ohio counties), while
+# Jacksonville (FL) rolls into Duval Co. - Florida and Tampa (FL) rolls into
+# Hillsborough Co. - Florida. This is a project-specific reporting convention.
 EHE_JURISDICTIONS = frozenset(j for j in CANONICAL_JURISDICTIONS if j not in JURISDICTION_ROLLUP)
+
+# Explicit source-label aliases prevent double counting of city and county labels.
+# _nfkd() normalizes whitespace, so Ohio with a nonbreaking space also matches.
+JURISDICTION_ALIASES = {
+    "ohio (oh)": "Ohio (OH)",
+    "ohio (ohio)": "Ohio (OH)",
+    "ohio": "Ohio (OH)",
+    "jacksonville (fl)": "Duval Co. - Florida",
+    "jacksonville (florida)": "Duval Co. - Florida",
+    "jacksonville, fl": "Duval Co. - Florida",
+    "jacksonville, florida": "Duval Co. - Florida",
+    "jacksonville - florida": "Duval Co. - Florida",
+    "tampa (fl)": "Hillsborough Co. - Florida",
+    "tampa (florida)": "Hillsborough Co. - Florida",
+    "tampa, fl": "Hillsborough Co. - Florida",
+    "tampa, florida": "Hillsborough Co. - Florida",
+    "tampa - florida": "Hillsborough Co. - Florida",
+}
 
 STATE_ABBR = {
     "al": "alabama", "az": "arizona", "ar": "arkansas", "ca": "california",
@@ -82,7 +103,8 @@ CITY_TO_PLACE = {
     "columbus": ("franklin", "ohio"),            "dallas": ("dallas", "texas"),
     "detroit": ("wayne", "michigan"),            "fort lauderdale": ("broward", "florida"),
     "fort worth": ("tarrant", "texas"),          "houston": ("harris", "texas"),
-    "indianapolis": ("marion", "indiana"),       "las vegas": ("clark", "nevada"),
+    "indianapolis": ("marion", "indiana"),       "jacksonville": ("duval", "florida"),
+    "las vegas": ("clark", "nevada"),
     "memphis": ("shelby", "tennessee"),          "new orleans": ("orleans", "louisiana"),
     "new york": ("new york", "new york"),        "newark": ("essex", "new jersey"),
     "philadelphia": ("philadelphia", "pennsylvania"),
@@ -90,7 +112,8 @@ CITY_TO_PLACE = {
     "san bernadino": ("san bernardino", "california"),
     "san bernardino": ("san bernardino", "california"),
     "san juan": ("san juan", "puerto rico"),     "santa ana": ("orange", "california"),
-    "seattle": ("king", "washington"),           "washington": ("washington", "district of columbia"),
+    "seattle": ("king", "washington"),          "tampa": ("hillsborough", "florida"),
+    "washington": ("washington", "district of columbia"),
     "washington dc": ("washington", "district of columbia"),
     "west palm beach": ("palm beach", "florida"),
 }
@@ -151,6 +174,12 @@ def _match_jurisdiction(raw: Any) -> str | None:
     n = _nfkd(raw)
     if not n or n.casefold() in JURISDICTION_BLANKS:
         return None
+
+    # These names must resolve to the same standardized reporting jurisdiction;
+    # retain the raw label on the original ticket/interaction for traceability.
+    alias = JURISDICTION_ALIASES.get(n.casefold())
+    if alias:
+        return alias
 
     place, state = n, ""
     paren = re.match(r"^(.*?)\s*\(([^)]*)\)\s*$", n)
