@@ -4895,6 +4895,219 @@ def _report_dedup(removed, label):
             f"{'entry' if removed == 1 else 'entries'} matching this one."
         )
 
+
+# --- Simple duplicate prevention (same normalized-field approach as Interaction logs) ----
+# No fingerprints, new columns, or archive worksheets. Avoid duplicate email notifications.
+# Submitted form fields are compared; generated Drive links and workflow states are not.
+_TA_REQUEST_DUP_KEYS = (
+    'Jurisdiction', 'Organization', 'Name', 'Title/Position', 'Email Address',
+    'Phone Number', 'Focus Area', 'TA Type', 'Targeted Due Date',
+    'TA Description', 'Priority',
+)
+_TA_TRAVEL_DUP_KEYS = (
+    'Name', 'Email', 'Destination', 'Purpose of Travel', 'Objective', 'Attendees',
+    'Departure Date', 'Return Date', 'Deliverables', 'Organization',
+    'Address1', 'Address2', 'City', 'State', 'Zip', 'Signature', 'Signature Date',
+    'Mileage Dates', 'Mileage Amounts', 'Total Mileage', 'Expense Dates',
+    'Airfare', 'Ground Transport', 'Parking', 'Lodging', 'Baggage', 'Misc', 'Misc2',
+    'Misc Desc1', 'Misc Desc2', 'Total Airfare', 'Total Ground Transport',
+    'Total Parking', 'Total Lodging', 'Total Baggage', 'Total Misc',
+    'Per Diem Dates', 'Per Diem Amounts', 'Breakfast Checks', 'Lunch Checks',
+    'Dinner Checks', 'Total Per Diem', 'Total Amount Due',
+)
+
+
+def _ta_duplicate_value(value, date=False):
+    """Ignore minor spacing/case/numeric formatting, but not changed form content."""
+    if date:
+        return _dedup_date(value)
+    if value is None:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except (ValueError, TypeError):
+        pass
+    raw = str(value).strip()
+    if raw.casefold() in {'', 'nan', 'nat', 'none', 'null'}:
+        return ''
+    if re.fullmatch(r'[+-]?\d+(?:\.\d+)?', raw):
+        try:
+            return format(float(raw), '.12g')
+        except ValueError:
+            pass
+    return _dedup_text(raw)
+
+
+def _ta_duplicate_identity(row, columns):
+    date_columns = {'Targeted Due Date', 'Departure Date', 'Return Date', 'Signature Date'}
+    return tuple(_ta_duplicate_value(row.get(col, ''), col in date_columns) for col in columns)
+
+
+def _ta_matching_requests(records, proposed, today=None):
+    """Same-day exact form submissions, not repeat TA needs on later dates."""
+    now_day = today or datetime.now().strftime('%Y-%m-%d')
+    ident = _ta_duplicate_identity(proposed, _TA_REQUEST_DUP_KEYS)
+    if not all(ident[i] for i in (0, 2, 4, 9)):
+        return []
+    return [r for r in records if
+            _dedup_date(r.get('Submit Date', '')) == now_day and
+            _ta_duplicate_identity(r, _TA_REQUEST_DUP_KEYS) == ident and
+            str(r.get('Ticket ID', '')).strip()]
+
+
+def _ta_travel_record_from_review(review):
+    """Construct the Travel comparison values before any upload or email."""
+    mapped = {
+        'Name': review.get('name', ''), 'Email': review.get('email', ''),
+        'Destination': review.get('destination', ''),
+        'Purpose of Travel': review.get('purpose_of_travel', ''),
+        'Objective': review.get('objective', ''), 'Attendees': review.get('attendees', ''),
+        'Departure Date': review.get('departure_date', ''),
+        'Return Date': review.get('return_date', ''),
+        'Deliverables': review.get('deliverables', ''),
+        'Organization': review.get('organization', 'Georgetown University'),
+        'Address1': review.get('address1', ''), 'Address2': review.get('address2', ''),
+        'City': review.get('city', ''), 'State': review.get('state', ''),
+        'Zip': review.get('zip', ''), 'Signature': review.get('signature', ''),
+        'Signature Date': review.get('signature_date', ''),
+        'Misc Desc1': review.get('misc_desc1', ''),
+        'Misc Desc2': review.get('misc_desc2', ''),
+    }
+    fields = {
+        'Mileage Dates': 'mileage_dates', 'Mileage Amounts': 'mileage_amounts',
+        'Total Mileage': 'total_mileage', 'Expense Dates': 'expense_dates',
+        'Airfare': 'airfare', 'Ground Transport': 'ground_transport',
+        'Parking': 'parking', 'Lodging': 'lodging', 'Baggage': 'baggage',
+        'Misc': 'misc', 'Misc2': 'misc2', 'Total Airfare': 'total_airfare',
+        'Total Ground Transport': 'total_ground_transport', 'Total Parking': 'total_parking',
+        'Total Lodging': 'total_lodging', 'Total Baggage': 'total_baggage',
+        'Total Misc': 'total_misc', 'Per Diem Dates': 'per_diem_dates',
+        'Per Diem Amounts': 'per_diem_amounts', 'Breakfast Checks': 'breakfast_checks',
+        'Lunch Checks': 'lunch_checks', 'Dinner Checks': 'dinner_checks',
+        'Total Per Diem': 'total_per_diem', 'Total Amount Due': 'total_amount_due',
+    }
+    for column, source in fields.items():
+        list_cols = {'Mileage Dates', 'Mileage Amounts', 'Expense Dates', 'Airfare', 'Ground Transport',
+                     'Parking', 'Lodging', 'Baggage', 'Misc', 'Misc2', 'Per Diem Dates',
+                     'Per Diem Amounts', 'Breakfast Checks', 'Lunch Checks', 'Dinner Checks'}
+        value = review.get(source, [] if column in list_cols else 0)
+        mapped[column] = json.dumps(value) if isinstance(value, (list, dict)) else value
+    return mapped
+
+
+def _ta_travel_groups(records):
+    """Return sheet-row positions for exactly matching authorizations."""
+    groups = {}
+    for pos, record in enumerate(records):
+        identity = _ta_duplicate_identity(record, _TA_TRAVEL_DUP_KEYS)
+        if not all(_ta_duplicate_value(record.get(key)) for key in
+                   ('Name', 'Email', 'Destination', 'Departure Date', 'Return Date')):
+            continue
+        groups.setdefault(identity, []).append(pos)
+    return {identity: positions for identity, positions in groups.items() if len(positions) > 1}
+
+
+def _ta_travel_has_approval(record):
+    """Never delete any row with a decision, signature, or finalized PDF."""
+    for prefix in ('Program Assistant', 'Lead TA', 'Director'):
+        status = _ta_duplicate_value(record.get(f'{prefix} Approval Status', ''))
+        if status and status not in {'pending', 'awaiting approval', 'not started'}:
+            return True
+        if _ta_duplicate_value(record.get(f'{prefix} Approval Date', '')):
+            return True
+        if _ta_duplicate_value(record.get(f'{prefix} Signature', '')):
+            return True
+    return any(_ta_duplicate_value(record.get(k, '')) for k in
+               ('Final PDF Link', 'Final Signed Form Link'))
+
+
+def _ta_keep_travel_index(records, matches):
+    """Keep the latest row unless a prior copy contains approval history."""
+    protected = [p for p in matches if _ta_travel_has_approval(records[p])]
+    return protected[-1] if protected else matches[-1]
+
+
+def _ta_travel_duplicate_lookup(records, proposed):
+    identity = _ta_duplicate_identity(proposed, _TA_TRAVEL_DUP_KEYS)
+    if not all(_ta_duplicate_value(proposed.get(k)) for k in
+               ('Name', 'Email', 'Destination', 'Departure Date', 'Return Date')):
+        return None
+    matching = [pos for pos, row in enumerate(records)
+                if _ta_duplicate_identity(row, _TA_TRAVEL_DUP_KEYS) == identity]
+    return _ta_keep_travel_index(records, matching) if matching else None
+
+
+def _ta_delete_travel_duplicate(sheet_row, expected_identity):
+    """Staff-only, confirmed deletion of one unsigned, genuinely duplicate Travel row."""
+    if not st.session_state.get('authenticated') or st.session_state.get('role') != 'Assignee/Staff':
+        raise PermissionError('Only signed-in TA staff can delete duplicate authorizations.')
+    ws = get_spreadsheet().worksheet('Travel')
+    records = ws.get_all_records(default_blank='')  # re-read before any deletion
+    index = int(sheet_row) - 2
+    if not (0 <= index < len(records)):
+        raise ValueError('The record has moved; refresh and try again.')
+    if _ta_duplicate_identity(records[index], _TA_TRAVEL_DUP_KEYS) != expected_identity:
+        raise ValueError('The record has changed; refresh and try again.')
+    groups = _ta_travel_groups(records)
+    group = groups.get(expected_identity, [])
+    if index not in group:
+        raise ValueError('This is no longer a duplicate.')
+    if index == _ta_keep_travel_index(records, group):
+        raise ValueError('Cannot delete the retained authorization.')
+    if _ta_travel_has_approval(records[index]):
+        raise ValueError('This authorization contains an approval decision and cannot be deleted.')
+    ws.delete_rows(sheet_row)
+    load_travel_sheet.clear()
+
+
+def render_ta_travel_duplicate_management():
+    """Compact staff-only manual cleanup; no archive or extra Sheets columns."""
+    if not st.session_state.get('authenticated') or st.session_state.get('role') != 'Assignee/Staff':
+        return
+    with st.expander('🧹 **REMOVE DUPLICATE TRAVEL AUTHORIZATIONS**', expanded=False):
+        st.caption('Remove older, matching travel authorizations. Keep the latest; approval decisions and signatures are protected. Deleted rows cannot be restored here.')
+        notice = st.session_state.pop('ta_travel_duplicate_deleted', None)
+        if notice:
+            st.success(notice)
+        # Only read the live Travel sheet when staff actively open the scan.
+        # A collapsed expander still runs Python on every Streamlit rerun.
+        if not st.checkbox('Check for duplicate authorizations',
+                           key='ta_travel_duplicate_scan'):
+            return
+        try:
+            ws = get_spreadsheet().worksheet('Travel')
+            records = ws.get_all_records(default_blank='')
+            groups = _ta_travel_groups(records)
+            options = []
+            for identity, indices in groups.items():
+                keep = _ta_keep_travel_index(records, indices)
+                for index in indices:
+                    if index == keep or _ta_travel_has_approval(records[index]):
+                        continue
+                    record = records[index]
+                    title = (f'Row {index+2} · {record.get("Name", "")} · '
+                             f'{record.get("Destination", "")} · '
+                             f'{record.get("Departure Date", "")} to '
+                             f'{record.get("Return Date", "")} · Keep row {keep+2}')
+                    options.append((index + 2, identity, title))
+            if not options:
+                st.info('No removable duplicate travel authorizations found.')
+                return
+            selected = st.selectbox('Choose an older duplicate', list(range(len(options))),
+                                    format_func=lambda i: options[i][2], key='ta_travel_duplicate_pick')
+            confirmed = st.checkbox('I confirm this older duplicate can be permanently deleted.',
+                                    key='ta_travel_duplicate_confirm')
+            if st.button('Delete duplicate authorization', key='ta_travel_duplicate_delete',
+                         disabled=not confirmed, type='primary'):
+                row_number, signature, _ = options[selected]
+                _ta_delete_travel_duplicate(row_number, signature)
+                st.session_state['ta_travel_duplicate_deleted'] = f'Duplicate travel authorization (row {row_number}) deleted.'
+                st.rerun()
+        except Exception as exc:
+            st.error(f'Unable to manage duplicate travel authorizations: {exc}')
+
+
 @st.cache_data(ttl=600)
 def load_support_sheet():
     return pd.DataFrame(_get_records_with_retry('HRSA64_TA_Request', 'GA_Support'))
@@ -5768,6 +5981,25 @@ else:
                 for error in errors:
                     st.warning(error)
             else:
+                # Check the live Main sheet before uploading or emailing. A repeated
+                # same-day request reuses its existing ticket, with no second email.
+                request_proposed = {
+                    'Jurisdiction': location, 'Organization': organization, 'Name': name,
+                    'Title/Position': title, 'Email Address': email,
+                    'Phone Number': formatted_phone, 'Focus Area': focus_area,
+                    'TA Type': type_TA, 'Targeted Due Date': due_date.strftime('%Y-%m-%d'),
+                    'TA Description': ta_description, 'Priority': priority_status,
+                }
+                request_ws = get_spreadsheet().worksheet('Main')
+                recent_requests = request_ws.get_all_records(default_blank='')
+                duplicates = _ta_matching_requests(recent_requests, request_proposed)
+                if duplicates:
+                    st.info(f'This request was already submitted today as {duplicates[-1]["Ticket ID"]}. No duplicate record or email was created.')
+                    st.stop()
+                # Refresh the next ticket ID from the live backend, not stale UI data.
+                ids = [int(m.group(1)) for r in recent_requests
+                       if (m := re.fullmatch(r'GU(\d+)', str(r.get('Ticket ID', '')).strip()))]
+                new_ticket_id = f'GU{max(ids, default=0)+1:04d}'
                 # Only upload files if all validation passes
                 if document:
                     try:
@@ -5817,16 +6049,21 @@ else:
                 new_data = pd.DataFrame([new_row])
 
                 try:
-                    # Append new data to Google Sheet
-                    updated_sheet = pd.concat([df, new_data], ignore_index=True)
-                    updated_sheet = updated_sheet.applymap(
-                        lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (datetime, pd.Timestamp)) else x
-                    )
-                    # Replace NaN with empty strings to ensure JSON compatibility
-                    updated_sheet = updated_sheet.fillna("")
-                    spreadsheet1 = get_spreadsheet()
-                    worksheet1 = spreadsheet1.worksheet('Main')
-                    worksheet1.update([updated_sheet.columns.values.tolist()] + updated_sheet.values.tolist())
+                    # Recheck and append only this record; never overwrite other tickets.
+                    worksheet1 = get_spreadsheet().worksheet('Main')
+                    latest = worksheet1.get_all_records(default_blank='')
+                    existing = _ta_matching_requests(latest, request_proposed)
+                    if existing:
+                        st.info(f'This request already exists as {existing[-1]["Ticket ID"]}. No duplicate record or email was created.')
+                        st.stop()
+                    if any(str(r.get('Ticket ID', '')).strip() == new_ticket_id for r in latest):
+                        st.error('Another request was saved at the same time. Please resubmit to generate a unique ticket ID.')
+                        st.stop()
+                    headers = worksheet1.row_values(1)
+                    worksheet1.append_row([
+                        '' if pd.isna(new_row.get(col, '')) else str(new_row.get(col, ''))
+                        for col in headers
+                    ], value_input_option='RAW')
                     
                     # Clear cache to refresh data
                     load_main_sheet.clear()  # only the sheet just written, not every cached loader
@@ -9079,6 +9316,8 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
+                render_ta_travel_duplicate_management()
+
                 with st.expander("🧳 **GENERATE DOMESTIC TRAVEL AUTHORIZATION FORM**"):
                     st.markdown("""
                         <div class="gutap-hero">
@@ -9586,6 +9825,22 @@ GU-TAP System
                             approved = st.checkbox("I have reviewed and approve this travel form.", key="travel_approve_review")
                             generate_now = st.button("✅ Finalize and Send for Approval", disabled=not approved, key="travel_generate_now", type="primary", use_container_width=True)
                             if generate_now and approved:
+                                # Check live Travel records before any upload, write, or email.
+                                proposed_travel = _ta_travel_record_from_review(review)
+                                live_travel_ws = get_spreadsheet().worksheet('Travel')
+                                prior_travel = live_travel_ws.get_all_records(default_blank='')
+                                existing_pos = _ta_travel_duplicate_lookup(prior_travel, proposed_travel)
+                                reuse_incomplete_travel = False
+                                if existing_pos is not None:
+                                    existing_row = prior_travel[existing_pos]
+                                    already_sent = bool(_ta_duplicate_value(existing_row.get('PDF Link', '')))
+                                    already_sent = already_sent or any(_ta_duplicate_value(existing_row.get(
+                                        f'{prefix} Approval Status', '')) for prefix in
+                                        ('Program Assistant', 'Lead TA', 'Director'))
+                                    if already_sent or _ta_travel_has_approval(existing_row):
+                                        st.info('An identical travel authorization is already on file. No additional PDF, row, or approval emails were generated.')
+                                        st.stop()
+                                    reuse_incomplete_travel = True
                                 # Upload support files to Google Drive if provided
                                 support_files_links = ""
                                 if 'travel_support_files_data' in st.session_state and st.session_state['travel_support_files_data']:
@@ -9695,29 +9950,33 @@ GU-TAP System
                                         'Travel Escalation Sent': '',
                                     }
                                     
-                                    new_travel_data = pd.DataFrame([new_travel_row])
-                                    
-                                    # Append new data to existing travel sheet
-                                    updated_travel_sheet = pd.concat([df_travel, new_travel_data], ignore_index=True)
-                                    updated_travel_sheet = updated_travel_sheet.fillna("")
-                                    
-                                    # Update Google Sheet
-                                    spreadsheet_travel = get_spreadsheet()
-                                    try:
-                                        worksheet_travel = spreadsheet_travel.worksheet('Travel')
-                                    except:
-                                        # Create worksheet if it doesn't exist
-                                        worksheet_travel = spreadsheet_travel.add_worksheet(title='Travel', rows=1000, cols=20)
-                                    
-                                    worksheet_travel.update([updated_travel_sheet.columns.values.tolist()] + updated_travel_sheet.values.tolist())
-                                    
-                                    # Clear cache to refresh data
-                                    load_travel_sheet.clear()  # only the sheet just written, not every cached loader
-                                    
-                                    st.success("Saved.")
-                                    
+                                    # Save only the matching Travel row. Reuse an
+                                    # incomplete copy, otherwise append once.
+                                    worksheet_travel = get_spreadsheet().worksheet('Travel')
+                                    sheet_headers = worksheet_travel.row_values(1)
+                                    missing_columns = [c for c in new_travel_row if c not in sheet_headers]
+                                    if missing_columns:
+                                        _ta_ensure_columns(worksheet_travel, missing_columns)
+                                        sheet_headers = worksheet_travel.row_values(1)
+                                    if reuse_incomplete_travel:
+                                        saved_travel_row = existing_pos + 2
+                                        # Preserve any other columns not owned by this form.
+                                        edits = [
+                                            {'range': gspread.utils.rowcol_to_a1(saved_travel_row, sheet_headers.index(col) + 1),
+                                             'values': [[str(value if value is not None else '')]]}
+                                            for col, value in new_travel_row.items()
+                                        ]
+                                        worksheet_travel.batch_update(edits, value_input_option='RAW')
+                                    else:
+                                        worksheet_travel.append_row(
+                                            [str(new_travel_row.get(col, '') if new_travel_row.get(col, '') is not None else '')
+                                             for col in sheet_headers], value_input_option='RAW')
+                                        saved_travel_row = len(worksheet_travel.get_all_records(default_blank='')) + 1
+                                    load_travel_sheet.clear()
+                                    st.success('Travel authorization saved.')
                                 except Exception as e:
-                                    st.warning(f"⚠️ Error saving to Google Sheets: {str(e)}")
+                                    st.error(f'Unable to save travel authorization: {e}')
+                                    st.stop()  # Never send an approval email without a saved row.
                                 
                                 pdf_buffer = create_pdf(review, ws)
                                 pdf_filename = f"Travel_Authorization_Form_{review.get('name','')}_{review.get('departure_date','')}_{review.get('return_date','')}.pdf"
@@ -9749,26 +10008,16 @@ GU-TAP System
                                         st.error("❌ No travel forms found in the sheet. Please submit the form first.")
                                         st.stop()
                                     
-                                    # Find the row that matches this submission (by name and submission date)
-                                    submission_date = datetime.now().strftime('%Y-%m-%d')
-                                    traveler_name = review.get('name', '')
-                                    
-                                    # Try to find matching row
-                                    row_idx = None
-                                    if 'Name' in df_travel.columns and 'Submission Date' in df_travel.columns:
-                                        matching_rows = df_travel[
-                                            (df_travel['Name'].astype(str) == str(traveler_name)) &
-                                            (df_travel['Submission Date'].astype(str).str.contains(submission_date, na=False))
-                                        ]
-                                        
-                                        if not matching_rows.empty:
-                                            # Use the most recent matching row (last one)
-                                            row_idx = matching_rows.index[-1]
-                                    
-                                    # Fallback to last row if no match found
+                                    # Select this submission by its full form identity,
+                                    # never by name+date or a fallback to the last row.
+                                    submission_rows = df_travel.fillna('').to_dict('records')
+                                    row_idx = _ta_travel_duplicate_lookup(submission_rows, proposed_travel)
                                     if row_idx is None:
-                                        row_idx = len(df_travel) - 1
-                                    
+                                        st.error('Could not safely match this form to its saved record. No approval emails were sent.')
+                                        st.stop()
+                                    traveler_name = review.get('name', '')
+                                    # A row with this form identity already existed before
+                                    # submission only when it was an incomplete draft.
                                     if row_idx >= 0 and row_idx < len(df_travel):
                                         updated_df_travel = df_travel.copy()
                                         
@@ -9794,16 +10043,26 @@ GU-TAP System
                                         updated_df_travel.loc[row_idx, approver1_status_col] = 'pending'
                                         updated_df_travel.loc[row_idx, approver2_status_col] = 'pending'
                                         
-                                        updated_df_travel = updated_df_travel.fillna("")
-                                        spreadsheet_travel = get_spreadsheet()
-                                        try:
-                                            worksheet_travel = spreadsheet_travel.worksheet('Travel')
-                                        except:
-                                            worksheet_travel = spreadsheet_travel.add_worksheet(title='Travel', rows=1000, cols=20)
-                                        
-                                        worksheet_travel.update([updated_df_travel.columns.values.tolist()] + updated_df_travel.values.tolist())
-                                        
-                                        st.success("Saved.")
+                                        # Only write the three affected cells, not
+                                        # every row in the Travel sheet.
+                                        worksheet_travel = get_spreadsheet().worksheet('Travel')
+                                        headers_live = _ta_ensure_columns(worksheet_travel, required_cols)
+                                        row_live = row_idx + 2
+                                        current_rows = worksheet_travel.get_all_records(default_blank='')
+                                        if not (0 <= row_idx < len(current_rows)) or (
+                                            _ta_duplicate_identity(current_rows[row_idx], _TA_TRAVEL_DUP_KEYS)
+                                            != _ta_duplicate_identity(proposed_travel, _TA_TRAVEL_DUP_KEYS)
+                                        ):
+                                            st.error('Travel row changed before approval routing. No approval emails sent.')
+                                            st.stop()
+                                        batch = [
+                                            {'range': gspread.utils.rowcol_to_a1(row_live, headers_live.index(col) + 1),
+                                             'values': [[str(updated_df_travel.loc[row_idx, col])]]}
+                                            for col in required_cols
+                                        ]
+                                        worksheet_travel.batch_update(batch, value_input_option='RAW')
+                                        load_travel_sheet.clear()
+                                        st.success('Travel authorization sent for approval.')
                                         
                                         # Send email notification to both approvers (determined dynamically above)
                                         traveler_name = review.get('name', 'Unknown')
