@@ -5061,52 +5061,6 @@ def _ta_delete_travel_duplicate(sheet_row, expected_identity):
     load_travel_sheet.clear()
 
 
-def render_ta_travel_duplicate_management():
-    """Compact staff-only manual cleanup; no archive or extra Sheets columns."""
-    if not st.session_state.get('authenticated') or st.session_state.get('role') != 'Assignee/Staff':
-        return
-    with st.expander('🧹 **REMOVE DUPLICATE TRAVEL AUTHORIZATIONS**', expanded=False):
-        st.caption('Remove older, matching travel authorizations. Keep the latest; approval decisions and signatures are protected. Deleted rows cannot be restored here.')
-        notice = st.session_state.pop('ta_travel_duplicate_deleted', None)
-        if notice:
-            st.success(notice)
-        # Only read the live Travel sheet when staff actively open the scan.
-        # A collapsed expander still runs Python on every Streamlit rerun.
-        if not st.checkbox('Check for duplicate authorizations',
-                           key='ta_travel_duplicate_scan'):
-            return
-        try:
-            ws = get_spreadsheet().worksheet('Travel')
-            records = ws.get_all_records(default_blank='')
-            groups = _ta_travel_groups(records)
-            options = []
-            for identity, indices in groups.items():
-                keep = _ta_keep_travel_index(records, indices)
-                for index in indices:
-                    if index == keep or _ta_travel_has_approval(records[index]):
-                        continue
-                    record = records[index]
-                    title = (f'Row {index+2} · {record.get("Name", "")} · '
-                             f'{record.get("Destination", "")} · '
-                             f'{record.get("Departure Date", "")} to '
-                             f'{record.get("Return Date", "")} · Keep row {keep+2}')
-                    options.append((index + 2, identity, title))
-            if not options:
-                st.info('No removable duplicate travel authorizations found.')
-                return
-            selected = st.selectbox('Choose an older duplicate', list(range(len(options))),
-                                    format_func=lambda i: options[i][2], key='ta_travel_duplicate_pick')
-            confirmed = st.checkbox('I confirm this older duplicate can be permanently deleted.',
-                                    key='ta_travel_duplicate_confirm')
-            if st.button('Delete duplicate authorization', key='ta_travel_duplicate_delete',
-                         disabled=not confirmed, type='primary'):
-                row_number, signature, _ = options[selected]
-                _ta_delete_travel_duplicate(row_number, signature)
-                st.session_state['ta_travel_duplicate_deleted'] = f'Duplicate travel authorization (row {row_number}) deleted.'
-                st.rerun()
-        except Exception as exc:
-            st.error(f'Unable to manage duplicate travel authorizations: {exc}')
-
 
 @st.cache_data(ttl=600)
 def load_support_sheet():
@@ -9308,7 +9262,6 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                render_ta_travel_duplicate_management()
 
                 with st.expander("🧳 **GENERATE DOMESTIC TRAVEL AUTHORIZATION FORM**"):
                     st.markdown("""
