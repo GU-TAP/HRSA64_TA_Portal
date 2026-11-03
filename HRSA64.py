@@ -7609,11 +7609,7 @@ GU-TAP System
                             
                             # Every travel form and where it stands (rejected ones included), newest first.
                             st.markdown("---")
-                            st.markdown("#### 📋 All travel forms — status (newest first)")
-                            st.caption(
-                                "A form rejected by one approver is closed and leaves everyone's queue. "
-                                "It stays here with who rejected it and why, so nothing just 'disappears'."
-                            )
+                            st.markdown("#### 📋 All travel forms — status")
                             render_status_table(
                                 build_travel_status_table(df_travel_review),
                                 key="coord_travel_status",
@@ -8287,11 +8283,7 @@ GU-TAP System
                             st.error(f"Error loading GSA exemption forms: {str(e)}")
                         # --- Every GSA exemption and where it stands, newest first ---
                         st.markdown("---")
-                        st.markdown("#### 📋 All GSA exemption forms — status (newest first)")
-                        st.caption(
-                            "A form rejected by one approver is closed for both. "
-                            "It stays here with who rejected it and why."
-                        )
+                        st.markdown("#### 📋 All GSA exemption forms — status")
                         try:
                             render_status_table(
                                 build_gsa_status_table(load_gsa_exemption_sheet()),
