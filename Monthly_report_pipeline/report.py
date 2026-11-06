@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+from html import escape
 import os
 import re
 import sys
@@ -979,10 +980,8 @@ def compute_payload(
         if c in tickets.columns:
             tickets[c] = pd.to_datetime(tickets[c], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    # "Jurisdictions Engaged" — MAIN sheet only. The Interaction sheet is deliberately not
-    # unioned in: it carries jurisdictions with no ticket on the main page, which inflated
-    # this number. 'Unknown' / blank is not a jurisdiction, so it is excluded too.
-    # Spelling was already canonicalized in normalize_main().
+    # Engaged reporting jurisdictions across tickets, interactions and deliveries.
+    # Exclude blank/unknown labels and apply the canonical program reporting roster.
     all_jurisdictions = sorted(
         j for j in df["Jurisdiction (Standardized)"].fillna("Unknown").astype(str).unique()
         if j.casefold() not in JURISDICTION_BLANKS and j != "Unknown"
@@ -1352,6 +1351,15 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="container">
+  <div class="card" id="compatibilityNotice">
+    <b>Static summary — all records in the supplied workbook.</b>
+    <p>The totals and summary below work without scripting. If this notice remains,
+    interactive charts and filters have not started. Download the file and open it
+    directly in a browser instead of an email or document preview.</p>
+  </div>
+  <style>
+    body:not(.dashboard-ready) .filterBar { display:none; }
+  </style>
 
   <!-- ============ FILTER BAR ============ -->
   <div class="filterBar">
@@ -1473,6 +1481,10 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 
   <!-- ============ FILTERED / PERIOD KPI STRIP ============ -->
+  <details class="card" id="staticSummary" open>
+    <summary>Printable summary by jurisdiction (all time; unaffected by filters)</summary>
+    __STATIC_JURISDICTIONS__
+  </details>
   <div class="card" style="margin-top:18px;">
     <div class="sectionHead">
       <h2 class="section">Current selection</h2>
@@ -1874,8 +1886,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function getFilters(){
-      const jurValue = jurSel.value;
-      const jurArray = jurValue === "All jurisdictions" ? ["All jurisdictions"] : jurValue.split(",");
+      // Names can contain commas (Washington, DC); keep selections as whole values.
+      const jurArray = Array.from(selectedJurisdictions);
       const gran = granSel.value;
       const year = yearSel.value;
       const sub = (gran === "year") ? ALL_PERIODS : periodSel.value;
@@ -2051,8 +2063,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       rows.forEach(r => { const j = String(r[JUR] || "Unknown"); if (j !== "Unknown") jurSet.add(j); });
       filteredInteractions(f).forEach(x => { const j = String(x[JUR] || "Unknown"); if (j !== "Unknown") jurSet.add(j); });
       filteredDeliveries(f).forEach(x => { const j = String(x[JUR] || "Unknown"); if (j !== "Unknown") jurSet.add(j); });
-      itas.forEach(a => a.jurisdictions.forEach(j => jurSet.add(j)));
-      plns.forEach(a => a.jurisdictions.forEach(j => jurSet.add(j)));
+      // Shared sessions match a selected participant, but their other participants
+      // must not inflate the number of jurisdictions in the current selection.
+      itas.forEach(a => a.jurisdictions.forEach(j => { if (jurMatches(j, f)) jurSet.add(j); }));
+      plns.forEach(a => a.jurisdictions.forEach(j => { if (jurMatches(j, f)) jurSet.add(j); }));
 
       /* current-selection strip */
       document.getElementById("kpiSubmitted").textContent = fmtNum(submitted);
@@ -2941,6 +2955,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     updateJurSelection();
     setTotals();
     rerender();
+    document.body.classList.add("dashboard-ready");
+    document.getElementById("compatibilityNotice").style.display = "none";
+    document.getElementById("staticSummary").open = false;
   </script>
   </div>
 </body>
@@ -3000,6 +3017,28 @@ def build_html(payload: dict, title: str, logo_path: str = "logo.png") -> str:
     html = html.replace("__LOGO_BLOCK__", logo_block)
     html = html.replace("__PLOTLY_SNIPPET__", plotly_snippet)
     html = html.replace("__DATA_JSON__", data_json)
+    # Render headline values in Python: blocked/failed JavaScript must not erase them.
+    summary = payload.get("summary", {})
+    totals = {
+        "totTickets": "total_tickets", "totCompleted": "completed_tickets",
+        "totProgress": "in_progress_tickets", "totJurisdictions": "total_jurisdictions",
+        "totInteractions": "total_interactions", "totDeliveries": "total_deliveries",
+        "totITA": "total_itas", "totPLN": "total_plns",
+    }
+    for element_id, key in totals.items():
+        html = html.replace(f'id="{element_id}">&mdash;',
+                            f'id="{element_id}">{int(summary.get(key, 0))}')
+    jurisdiction_key = "Jurisdiction (Standardized)"
+    rows = []
+    for jurisdiction in payload.get("jurisdictions", []):
+        counts = [sum(r.get(jurisdiction_key) == jurisdiction for r in payload.get(kind, []))
+                  for kind in ("tickets", "interactions", "deliveries")]
+        rows.append("<tr><td>" + escape(jurisdiction) + "</td>" +
+                    "".join(f"<td>{count}</td>" for count in counts) + "</tr>")
+    table = ("<table><thead><tr><th>Jurisdiction</th><th>Tickets</th>"
+             "<th>Interactions</th><th>Deliveries</th></tr></thead><tbody>" +
+             "".join(rows) + "</tbody></table>")
+    html = html.replace("__STATIC_JURISDICTIONS__", table)
     return html
 
 
