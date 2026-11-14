@@ -1909,6 +1909,10 @@ def send_email_mailjet(to_email, subject, body):
     here, so switching providers is a secrets change, not a code change. The actual
     backend is chosen by [email] transport in secrets.
     """
+    # Safety net: an RA whose account is switched off gets no automatic email from any part
+    # of the app. Treated as "sent" so reminder bookkeeping and success messages are unaffected.
+    if ra_account_is_off(to_email):
+        return True
     try:
         if _email_transport() == "gmail":
             return _send_via_gmail_smtp(to_email, subject, body)
@@ -1917,8 +1921,18 @@ def send_email_mailjet(to_email, subject, body):
         st.error(f"❗ Email error ({_email_transport()}): {e}")
         return False
 
-# Research assistant roster (email only; all RAs are notified for new requests)
-STUDENT_SCHEDULE = {
+# --- RA on/off switches -----------------------------------------------------------------
+# True  = account is OFF: cannot sign in as Research Assistant, gets no automatic emails,
+#         and is not listed as a Preferred Research Assistant.
+# False = account is back ON: everything works as before.
+HANG_OFF = True
+
+RA_OFF = {
+    "Hang Nguyen": HANG_OFF,
+}
+
+# Full research assistant roster (email only), including anyone switched off above.
+RA_ROSTER = {
     "Asha Patel": {"email": "ap2349@georgetown.edu"},
     "Hang Nguyen": {"email": "htn16@georgetown.edu"},
     "Jocelin Diaz": {"email": "jd2262@georgetown.edu"},
@@ -1926,6 +1940,23 @@ STUDENT_SCHEDULE = {
     "Desiree Butler": {"email": "db1718@georgetown.edu"},
     "Japhet Osuji": {"email": "jo903@georgetown.edu"},
 }
+
+# Active RAs only. Every RA email (new request, re-assignment, unassigned reminders) and the
+# Preferred Research Assistant dropdown read this, so an RA switched off drops out of all of them.
+STUDENT_SCHEDULE = {
+    name: info for name, info in RA_ROSTER.items() if not RA_OFF.get(name, False)
+}
+
+# Emails of RAs who are switched off (lower-case).
+RA_OFF_EMAILS = {
+    info["email"].strip().lower()
+    for name, info in RA_ROSTER.items()
+    if RA_OFF.get(name, False)
+}
+
+
+def ra_account_is_off(email):
+    return str(email or "").strip().lower() in RA_OFF_EMAILS
 
 
 def send_ga_support_notifications_to_all(
@@ -6137,7 +6168,12 @@ else:
                 # Normalize email to lowercase for case-insensitive lookup
                 email_normalized = email.strip().lower() if email else ""
                 user_roles = USERS.get(email_normalized)
-                if user_roles and st.session_state.role in user_roles:
+                if st.session_state.role == "Research Assistant" and ra_account_is_off(email_normalized):
+                    st.error(
+                        "This Research Assistant account is currently inactive. "
+                        "Please contact the GU-TAP team if you think this is a mistake."
+                    )
+                elif user_roles and st.session_state.role in user_roles:
                     user = user_roles[st.session_state.role]
                     if user["password"] == password:
                         st.session_state.authenticated = True
@@ -6149,6 +6185,16 @@ else:
                         st.error("Invalid credentials or role mismatch.")
                 else:
                     st.error("Invalid credentials or role mismatch.")
+
+        elif st.session_state.role == "Research Assistant" and ra_account_is_off(st.session_state.get("user_email")):
+            # Already signed in when the account was switched off: end the session.
+            st.session_state.authenticated = False
+            st.session_state.user_email = ""
+            st.session_state.user_display_name = ""
+            st.error(
+                "This Research Assistant account is currently inactive. "
+                "Please contact the GU-TAP team if you think this is a mistake."
+            )
 
         else:
             run_reminder_sweeps()
