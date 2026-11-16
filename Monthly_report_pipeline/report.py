@@ -753,103 +753,45 @@ def normalize_deliveries(df_del: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Additional TA activities: Intensives (ITA) and Peer Learning Networks (PLN)
+# Intensive TAs (ITA): read from the TA request workbook's Interaction sheet
 # ---------------------------------------------------------------------------
-ITA_SHEET = "Intensives"
-PLN_SHEET = "PLNs"
+# ITAs are logged in the TA Portal as Interaction rows with
+# TA / Activity Category = "Intensive Technical Assistance Workshop", one row per
+# jurisdiction that attended. portal_group_sessions() already combines those rows
+# into one session per dated workshop, so ITAs come from there. The separate
+# "HRSA064 Additional TA activities.xlsx" workbook is no longer used.
+_ITA_LABEL = re.compile(r"^\s*ITA\s*#?\s*(\d+)\s*(?:[-:–—]\s*(.*))?$", re.I)
 
 
-def _split_jurisdiction_list(value: Any) -> list[str]:
-    """'A County, B County' -> ['A County', 'B County'] (blank-safe)."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return []
-    s = str(value).strip()
-    if s.casefold() in {"nan", "nat", "none"}:
-        return []
-    if not s or s.casefold() in JURISDICTION_BLANKS:
-        return []
-    parts = [re.sub(r"\s+", " ", p).strip() for p in s.split(",")]
-    return [p for p in parts if p and p.casefold() not in JURISDICTION_BLANKS]
-
-
-def _normalize_activity_sheet(df: pd.DataFrame, jur_col: str, kind: str) -> pd.DataFrame:
-    """Shared cleanup for the Intensives / PLNs sheets."""
-    cols = ["ID", "Date", "Location", jur_col, "Status", "Focus Area", "Meeting Notes"]
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["ID", "Date", "Location", "Jurisdictions", "Status", "Focus Area", "Meeting Notes", "Kind"])
-
-    df = df.copy()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[cols].copy()
-    df = df.rename(columns={jur_col: "Jurisdictions"})
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    # Drop the empty filler rows Excel leaves behind.
-    df = df[df["Date"].notna() | df["ID"].notna()]
-    df = df[~(df["Date"].isna() & df["Jurisdictions"].isna())]
-
-    for c in ["Location", "Status", "Focus Area", "Meeting Notes"]:
-        df[c] = df[c].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-
-    df["Kind"] = kind
-    return df.reset_index(drop=True)
-
-
-def read_extra_activities(xlsx_path: str | None) -> dict[str, pd.DataFrame]:
-    """
-    Read 'HRSA064 Additional TA activities.xlsx'.
-    Sheet 'Intensives' -> ITAs, sheet 'PLNs' -> PLNs.
-    Missing file or sheets degrade to empty frames rather than failing the build.
-    """
-    empty = {
-        "ita": _normalize_activity_sheet(pd.DataFrame(), "Jurisdictions", "ITA"),
-        "pln": _normalize_activity_sheet(pd.DataFrame(), "Jurisdictions Attended", "PLN"),
-    }
-    if not xlsx_path or not os.path.exists(xlsx_path):
-        if xlsx_path:
-            print(f"i Optional historical Intensives workbook not found ({xlsx_path}); ITA panel will be empty.", file=sys.stderr)
-        return empty
-
-    try:
-        xls = pd.ExcelFile(xlsx_path)
-    except Exception as e:
-        print(f"! Could not open {xlsx_path}: {e}", file=sys.stderr)
-        return empty
-
-    ita_raw = pd.read_excel(xlsx_path, sheet_name=ITA_SHEET) if ITA_SHEET in xls.sheet_names else pd.DataFrame()
-    pln_raw = pd.read_excel(xlsx_path, sheet_name=PLN_SHEET) if PLN_SHEET in xls.sheet_names else pd.DataFrame()
-
-    return {
-        "ita": _normalize_activity_sheet(ita_raw, "Jurisdictions", "ITA"),
-        "pln": _normalize_activity_sheet(pln_raw, "Jurisdictions Attended", "PLN"),
-    }
-
-
-def activity_records(df: pd.DataFrame, spelling_map: dict[str, str]) -> list[dict[str, Any]]:
-    """Turn a normalized ITA/PLN frame into JSON-ready records for the dashboard."""
-    out: list[dict[str, Any]] = []
-    for _, row in df.iterrows():
-        jurs_raw = _split_jurisdiction_list(row.get("Jurisdictions"))
-        # Reuse the main sheet's spelling when we recognize the jurisdiction.
-        jurs = [spelling_map.get(j.casefold(), j) for j in jurs_raw]
-        dt = row.get("Date")
-        dt = pd.to_datetime(dt, errors="coerce")
-        out.append({
-            "id": None if pd.isna(row.get("ID")) else int(row.get("ID")),
-            "date": "" if pd.isna(dt) else dt.strftime("%Y-%m-%d"),
-            "month": "" if pd.isna(dt) else dt.strftime("%Y-%m"),
-            "location": str(row.get("Location") or ""),
-            "status": str(row.get("Status") or ""),
-            "focus_area": str(row.get("Focus Area") or ""),
-            "notes": str(row.get("Meeting Notes") or ""),
-            "jurisdictions": jurs,
-            "jurisdiction_count": len(jurs),
-            "complete": str(row.get("Status") or "").strip().casefold().startswith("complet"),
-        })
-    out.sort(key=lambda r: (r["date"] or "", r["id"] or 0))
-    return out
+def portal_ita_sessions(group_sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ITA workshops from the Interaction sheet, newest first, numbered by their ITA # label."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    itas = []
+    for s in group_sessions:
+        if s.get("category") != INTERACTION_CATEGORY_ITA:
+            continue
+        rec = dict(s)
+        label = clean_cell(rec.get("notes"))
+        m = _ITA_LABEL.match(label.splitlines()[0] if label else "")
+        rec["ita_number"] = int(m.group(1)) if m else None
+        # "ITA#3 - Washington, DC" -> where the workshop was held. Otherwise show the channel.
+        held_at = clean_cell(m.group(2)) if m and m.group(2) else ""
+        rec["channel"] = rec.get("location", "")
+        rec["location"] = held_at or rec.get("location", "")
+        # A workshop dated in the future is still scheduled; everything else has happened.
+        rec["complete"] = not rec.get("date") or rec["date"] <= today
+        rec["status"] = "Completed" if rec["complete"] else "Scheduled"
+        itas.append(rec)
+    itas.sort(key=lambda r: (r.get("date") or "", r.get("ita_number") or 0), reverse=True)
+    # Use the ITA # from the sheet as the row number; fall back to a running count.
+    unnumbered = len(itas)
+    for rec in itas:
+        if rec["ita_number"] is not None:
+            rec["id"] = rec["ita_number"]
+        else:
+            rec["id"] = f"–{unnumbered}"
+        unnumbered -= 1
+    return itas
 
 
 # -----------------------------
@@ -868,8 +810,6 @@ def compute_payload(
     df_main: pd.DataFrame,
     df_inter: pd.DataFrame,
     df_del: pd.DataFrame,
-    df_ita: pd.DataFrame | None = None,
-    df_pln: pd.DataFrame | None = None,
     id_col: str = "Ticket ID",
 ) -> dict[str, Any]:
 
@@ -1046,10 +986,9 @@ def compute_payload(
     if "Date of Delivery" in del_rec.columns:
         del_rec["Date of Delivery"] = pd.to_datetime(del_rec["Date of Delivery"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    # ---- Historical ITAs and confirmed portal PLN sessions -------------
-    spelling_map = {j.casefold(): j for j in engaged_jurisdictions}
-    ita_records = activity_records(df_ita, spelling_map) if df_ita is not None and not df_ita.empty else []
+    # ---- ITA workshops and PLN sessions, both from the Interaction sheet ----
     group_session_records = portal_group_sessions(df_inter)
+    ita_records = portal_ita_sessions(group_session_records)
     pln_records = [r for r in group_session_records if r["category"] == INTERACTION_CATEGORY_PLN]
 
     # Jurisdictions that only appear via an ITA/PLN still deserve a filter entry.
@@ -1075,7 +1014,7 @@ def compute_payload(
             "total_interactions": total_interactions,
             "total_deliveries": total_deliveries,
             "total_jurisdictions": total_jurisdictions,
-            # All portal-recorded PLN sessions are completed; optional legacy ITAs may be scheduled.
+            # Portal PLN sessions are all completed; an ITA dated in the future counts as scheduled.
             "total_itas": sum(1 for r in ita_records if r["complete"]),
             "total_plns": sum(1 for r in pln_records if r["complete"]),
             "scheduled_itas": sum(1 for r in ita_records if not r["complete"]),
@@ -1650,7 +1589,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       <thead><tr><th>Activity</th><th class="num">Sessions</th><th class="num">Jurisdictions reached</th></tr></thead>
       <tbody id="portalGroupSessionTbody"></tbody>
     </table></div>
-    <p class="subnote">Sessions are grouped by date, activity, interaction type and summary. The separate historical intensive-TA workbook is not included in this portal-only table.</p>
+    <p class="subnote">Sessions are grouped by date, activity, interaction type and summary.</p>
   </div>
 
   <!-- ============ ITA / PLN ============ -->
@@ -1659,7 +1598,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="sectionHead">
       <h2 class="section">ITA &amp; PLN sessions</h2>
     </div>
-    <p class="subnote">PLN session totals exclude emails, scheduling and follow-up interactions. Historical sessions are identified from meeting descriptions; other PLN-related records remain under TA interactions.</p>
+    <p class="subnote">ITAs are Interaction rows tagged <b>Intensive Technical Assistance Workshop</b>, combined into one workshop per date and session label (e.g. "ITA#3 - Washington, DC"). PLN session totals exclude emails, scheduling and follow-up interactions. Historical sessions are identified from meeting descriptions; other PLN-related records remain under TA interactions.</p>
 
     <div class="activity2">
       <div>
@@ -2569,6 +2508,7 @@ HTML_TEMPLATE = r"""<!doctype html>
           '<span class="pill accent" style="background:' + accent + ';"><b>' + esc(label) + ' #' + esc(a.id) + '</b></span>' +
           '<span class="pill"><b>Date:</b> ' + esc(a.date) + '</span>' +
           (a.location ? '<span class="pill"><b>' + (kind === "PLN" ? "Interaction type" : "Location") + ':</b> ' + esc(a.location) + '</span>' : "") +
+          (kind === "ITA" && a.channel ? '<span class="pill"><b>Interaction type:</b> ' + esc(a.channel) + '</span>' : "") +
           '<span class="badge ' + (a.complete ? "done" : "sched") + '">' + esc(a.complete ? "Complete" : (a.status || "Scheduled")) + '</span>' +
           '<span class="pill"><b>Jurisdictions:</b> ' + esc(a.jurisdiction_count) + '</span>' +
         '</div>' +
@@ -3045,26 +2985,16 @@ def build_html(payload: dict, title: str, logo_path: str = "logo.png") -> str:
 # -----------------------------
 # D) Main
 # -----------------------------
-DEFAULT_EXTRA_XLSX = "HRSA064 Additional TA activities.xlsx"
-
-
 def build_dashboard(xlsx_path: str, out_html: str, extra_xlsx: str | None = None) -> str:
+    """extra_xlsx is accepted for old run commands and ignored: ITAs now come from the
+    Interaction sheet of xlsx_path."""
     sheets = read_hrsa_workbook(xlsx_path)
 
     df_main = normalize_main(sheets.get("Main", pd.DataFrame()))
     df_inter = normalize_interactions(sheets.get("Interaction", pd.DataFrame()))
     df_del = normalize_deliveries(sheets.get("Delivery", pd.DataFrame()))
-
-    # Optional historical Intensive TA workbook. PLN sessions come only from Interaction.
-    if extra_xlsx is None:
-        extra_xlsx = os.path.join(os.path.dirname(os.path.abspath(xlsx_path)), DEFAULT_EXTRA_XLSX)
-    extra = read_extra_activities(extra_xlsx)
-
-    payload = compute_payload(
-        df_main, df_inter, df_del,
-        df_ita=extra["ita"], df_pln=None,
-        id_col="Ticket ID",
-    )
+    payload = compute_payload(df_main, df_inter, df_del, id_col="Ticket ID")
+    s = payload["summary"]
     # Look for logo.png in the same directory as the Excel file
     logo_path = os.path.join(os.path.dirname(xlsx_path), "logo.png")
     if not os.path.exists(logo_path):
@@ -3087,10 +3017,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--extra",
         default=None,
-        help=(
-            "Optional path to the historical Additional TA activities workbook (Intensives only). "
-            "Defaults to a file of that name next to --xlsx."
-        ),
+        help="No longer used (ITAs come from the Interaction sheet). Kept so old commands still run.",
     )
     parser.add_argument(
         "--out",
