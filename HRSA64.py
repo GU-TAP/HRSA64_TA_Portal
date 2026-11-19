@@ -34,6 +34,20 @@ import urllib.request
 if not hasattr(pd.DataFrame, "applymap"):
     pd.DataFrame.applymap = pd.DataFrame.map
 
+
+# --- Expanders that stay open ------------------------------------------------------------
+# Streamlit remembers whether an expander is open by its position on the page. If anything
+# above it appears or disappears between reruns (a one-off warning, an email notice), every
+# expander below shifts position, gets rebuilt and snaps shut - so picking a jurisdiction or
+# ticket inside a section closed that section. A key gives each expander a fixed identity,
+# so it stays open no matter what changes above it.
+def gutap_expander(label, key, expanded=False):
+    try:
+        return st.expander(label, expanded=expanded, key=key)
+    except TypeError:
+        # Streamlit older than the keyed-expander release: fall back to the plain version.
+        return st.expander(label, expanded=expanded)
+
 st.set_page_config(
     page_title="GU TAP System",
     page_icon="https://raw.githubusercontent.com/JiaqinWu/HRSA64_Dash/main/Georgetown_logo_blueRGB.png",
@@ -6197,7 +6211,11 @@ else:
             )
 
         else:
-            run_reminder_sweeps()
+            # Reminder sweeps run once per login and may print a notice (e.g. an email that
+            # failed). Keeping them in their own always-present container stops that one-off
+            # notice from shifting - and closing - every section below it.
+            with st.container():
+                run_reminder_sweeps()
             if st.session_state.role == "Coordinator":
                 user_info = USERS.get(st.session_state.user_email)
                 coordinator_name = user_info["Coordinator"]["name"]
@@ -6256,7 +6274,7 @@ else:
                     staff_list_sorted = sorted(staff_list, key=lambda x: x.split()[0])
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                    with st.expander("📝 **ASSIGN TA REQUESTS**"):
+                    with gutap_expander("📝 **ASSIGN TA REQUESTS**", key="exp_assign_ta_requests"):
                         st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -6404,7 +6422,7 @@ else:
 
                     # --- Transfer TA Requests (Coordinator only)
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                    with st.expander("🔄 **TRANSFER TA REQUESTS**"):
+                    with gutap_expander("🔄 **TRANSFER TA REQUESTS**", key="exp_transfer_ta_requests"):
                         st.markdown("""
                             <div class="gutap-hero">
                                 <div class="gutap-hero-title">
@@ -6582,7 +6600,7 @@ else:
                                         st.error(f"Error updating Google Sheets: {str(e)}")
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                    with st.expander("👍 **DETAILS OF IN-PROGRESS & COMPLETED REQUESTS**"):
+                    with gutap_expander("👍 **DETAILS OF IN-PROGRESS & COMPLETED REQUESTS**", key="exp_details_of_in_progress_completed_request"):
                         st.markdown("""
                             <div class="gutap-hero">
                                 <div class="gutap-hero-title">
@@ -6683,7 +6701,7 @@ else:
                                 }).fillna("").reset_index(drop=True))
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                    with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
+                    with gutap_expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**", key="exp_check_submit_interaction_log"):
                         st.markdown("""
                             <div class="gutap-hero">
                                 <div class="gutap-hero-title">
@@ -6981,7 +6999,7 @@ else:
 
                     st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                    with st.expander("📦 **SUBMIT DELIVERY FORM**"):
+                    with gutap_expander("📦 **SUBMIT DELIVERY FORM**", key="exp_submit_delivery_form"):
                         st.markdown("""
                             <div class="gutap-hero">
                                 <div class="gutap-hero-title">
@@ -7120,7 +7138,7 @@ else:
                 # Travel Authorization Review Center - visible to Jen, Kemisha, Lauren, Jiaqin
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                with st.expander("✈️ **REVIEW & APPROVE TRAVEL AUTHORIZATION FORMS**"):
+                with gutap_expander("✈️ **REVIEW & APPROVE TRAVEL AUTHORIZATION FORMS**", key="exp_review_approve_travel_authorization_form"):
                     # Check access control — everyone is identified by the approval SEAT they hold.
                     current_coordinator_email = st.session_state.user_email
                     my_seat = seat_for_email(current_coordinator_email)
@@ -7716,7 +7734,7 @@ GU-TAP System
                             st.error(f"Error loading travel forms: {str(e)}")
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                with st.expander("🧳 **REVIEW & APPROVE GSA LODGING EXEMPTION FORMS**"):
+                with gutap_expander("🧳 **REVIEW & APPROVE GSA LODGING EXEMPTION FORMS**", key="exp_review_approve_gsa_lodging_exemption_for"):
                     if not can_view_gsa_exemption_review:
                         st.info("This section is not available to you.")
                     else:
@@ -8386,7 +8404,7 @@ GU-TAP System
 
                 style_metric_cards(border_left_color="#DBF227")
 
-                with st.expander("🔎 **TA LOG LOOKUP**", expanded=False):
+                with gutap_expander("🔎 **TA LOG LOOKUP**", key="exp_ta_log_lookup", expanded=False):
                     st.markdown(
                         """
                         <div class="gutap-hero">
@@ -8454,7 +8472,7 @@ GU-TAP System
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 # --- Section 2: Filter, Sort, Comment
-                with st.expander("🚧 **IN-PROGRESS REQUESTS**"):
+                with gutap_expander("🚧 **IN-PROGRESS REQUESTS**", key="exp_in_progress_requests"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -8573,7 +8591,7 @@ GU-TAP System
                 render_ta_phases(df, staff_name)
                 st.divider()
 
-                with st.expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**"):
+                with gutap_expander("🗒️ **CHECK & SUBMIT INTERACTION LOG**", key="exp_check_submit_interaction_log_2"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -8890,7 +8908,7 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                with st.expander("👨‍💻 **SUBMIT STUDENT SUPPORT REQUEST FORM**"):
+                with gutap_expander("👨‍💻 **SUBMIT STUDENT SUPPORT REQUEST FORM**", key="exp_submit_student_support_request_form"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -9272,7 +9290,7 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                with st.expander("📬 **MY TRAVEL & GSA FORMS — STATUS**"):
+                with gutap_expander("📬 **MY TRAVEL & GSA FORMS — STATUS**", key="exp_my_travel_gsa_forms_status"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">📬 Track your forms</div>
@@ -9309,7 +9327,7 @@ GU-TAP System
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
 
-                with st.expander("🧳 **GENERATE DOMESTIC TRAVEL AUTHORIZATION FORM**"):
+                with gutap_expander("🧳 **GENERATE DOMESTIC TRAVEL AUTHORIZATION FORM**", key="exp_generate_domestic_travel_authorization_f"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -10154,7 +10172,7 @@ GU-TAP System
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
 
-                with st.expander("📦 **CHECK & SUBMIT DELIVERY LOG**"):
+                with gutap_expander("📦 **CHECK & SUBMIT DELIVERY LOG**", key="exp_check_submit_delivery_log"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -10399,7 +10417,7 @@ GU-TAP System
                                 st.error(f"Error updating Google Sheets: {str(e)}")
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                with st.expander("🧳 **GENERATE GSA LODGING RATE EXEMPTION FORM**"):
+                with gutap_expander("🧳 **GENERATE GSA LODGING RATE EXEMPTION FORM**", key="exp_generate_gsa_lodging_rate_exemption_form"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -10716,7 +10734,7 @@ GU-TAP System
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 # --- Section: View Completed Requests (Staff)
-                with st.expander("✅ **COMPLETED REQUESTS**"):
+                with gutap_expander("✅ **COMPLETED REQUESTS**", key="exp_completed_requests"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -10750,7 +10768,7 @@ GU-TAP System
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
                 # --- Section: Media Request System
-                with st.expander("📺 **MEDIA REQUEST SYSTEM**"):
+                with gutap_expander("📺 **MEDIA REQUEST SYSTEM**", key="exp_media_request_system"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -10815,7 +10833,7 @@ GU-TAP System
 
                 style_metric_cards(border_left_color="#DBF227")
 
-                with st.expander("🔎 **Support log lookup**", expanded=False):
+                with gutap_expander("🔎 **Support log lookup**", key="exp_support_log_lookup", expanded=False):
                     st.markdown(
                         """
                         <div class="gutap-hero">
@@ -10887,7 +10905,7 @@ GU-TAP System
                         )
 
                 # --- Section: View and Manage Submitted Support Requests
-                with st.expander("📋 **VIEW & MANAGE SUPPORT REQUESTS**"):
+                with gutap_expander("📋 **VIEW & MANAGE SUPPORT REQUESTS**", key="exp_view_manage_support_requests"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -11055,7 +11073,7 @@ GU-TAP System
 
                 # --- Section: Manage My Assigned Requests
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                with st.expander("🚧 **MY ASSIGNED REQUESTS**"):
+                with gutap_expander("🚧 **MY ASSIGNED REQUESTS**", key="exp_my_assigned_requests"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -11235,7 +11253,7 @@ GU-TAP System
 
                 # --- Section: Re-assign Support
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                with st.expander("🔄 **RE-ASSIGN SUPPORT**"):
+                with gutap_expander("🔄 **RE-ASSIGN SUPPORT**", key="exp_re_assign_support"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -11427,7 +11445,7 @@ GU-TAP System
 
                 # --- Section: View Completed Requests
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
-                with st.expander("✅ **COMPLETED REQUESTS**"):
+                with gutap_expander("✅ **COMPLETED REQUESTS**", key="exp_completed_requests_2"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
@@ -11467,7 +11485,7 @@ GU-TAP System
 
                 st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
 
-                with st.expander("🗒️ **LOG INTERACTION / DELIVERY FOR A TA PROVIDER**"):
+                with gutap_expander("🗒️ **LOG INTERACTION / DELIVERY FOR A TA PROVIDER**", key="exp_log_interaction_delivery_for_a_ta_provid"):
                     st.markdown("""
                         <div class="gutap-hero">
                             <div class="gutap-hero-title">
