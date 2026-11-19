@@ -41,6 +41,10 @@ if not hasattr(pd.DataFrame, "applymap"):
 # expander below shifts position, gets rebuilt and snaps shut - so picking a jurisdiction or
 # ticket inside a section closed that section. A key gives each expander a fixed identity,
 # so it stays open no matter what changes above it.
+# Set on signed-in pages; the reminder sweeps run into it at the end of the script.
+_REMINDER_SWEEP_BOX = None
+
+
 def gutap_expander(label, key, expanded=False):
     try:
         return st.expander(label, expanded=expanded, key=key)
@@ -70,8 +74,13 @@ html, body, .stMarkdown, button, textarea, input, label, [data-baseweb="select"]
     radial-gradient(900px 480px at 88% 0%, rgba(21, 101, 192, 0.08), transparent 50%),
     linear-gradient(168deg, #eef3fa 0%, #e4eaf4 42%, #f6f8fc 100%);
 }
+/* Streamlit 1.50 draws a solid top bar (about 3.75rem tall) over the page. Make it see-through
+   and start the content below it, so headers and the sign-in card are not cut off. */
+header[data-testid="stHeader"] {
+  background: transparent !important;
+}
 .block-container {
-  padding-top: 1.25rem !important;
+  padding-top: 3.75rem !important;
   padding-bottom: 2.75rem !important;
   max-width: 1200px !important;
 }
@@ -6164,7 +6173,11 @@ else:
         if not st.session_state.authenticated:
             _, login_mid, _ = st.columns([1, 2.1, 1])
             with login_mid:
-                with st.container(border=True):
+                # Held in a placeholder so the card can be swapped out the moment the password
+                # is accepted. Otherwise Streamlit keeps showing the old sign-in card until the
+                # whole dashboard has finished loading.
+                login_box = st.empty()
+                with login_box.container(border=True):
                     st.markdown(
                         """
                         <div class="gutap-login-lead">
@@ -6193,7 +6206,7 @@ else:
                         st.session_state.authenticated = True
                         st.session_state.user_email = email_normalized
                         st.session_state.user_display_name = user.get("name", "")
-                        st.success("Login successful!")
+                        login_box.info("✅ Signed in — opening your dashboard…")
                         st.rerun()
                     else:
                         st.error("Invalid credentials or role mismatch.")
@@ -6212,10 +6225,11 @@ else:
 
         else:
             # Reminder sweeps run once per login and may print a notice (e.g. an email that
-            # failed). Keeping them in their own always-present container stops that one-off
-            # notice from shifting - and closing - every section below it.
-            with st.container():
-                run_reminder_sweeps()
+            # failed). This reserves a fixed, always-present spot for that notice so it can't
+            # shift - and close - every section below it. The sweeps themselves run at the very
+            # end of the script (bottom of this file), so the dashboard appears right after
+            # login instead of the sign-in page lingering while the sheets are checked.
+            _REMINDER_SWEEP_BOX = st.container()
             if st.session_state.role == "Coordinator":
                 user_info = USERS.get(st.session_state.user_email)
                 coordinator_name = user_info["Coordinator"]["name"]
@@ -9066,10 +9080,11 @@ GU-TAP System
                             st.session_state["support_meeting_end_time"] = default_end_time
                         st.session_state["support_meeting_start_time_previous"] = meeting_start_time
                         with col3:
+                            # The value is already set in session state above, so no index= here:
+                            # passing both makes Streamlit show a yellow warning on the page.
                             meeting_end_time = st.selectbox(
                                 "End Time *",
                                 options=meeting_end_options,
-                                index=meeting_end_options.index(st.session_state["support_meeting_end_time"]),
                                 key="support_meeting_end_time",
                             )
                         meeting_time = f"{meeting_start_time}-{meeting_end_time}"
@@ -10903,7 +10918,7 @@ GU-TAP System
                         st.caption(
                             f"Showing {len(_ra_filt)} row(s). Refine the search to narrow results; data is read-only here."
                         )
-
+                st.markdown("<hr style='margin:2em 0; border:1px solid #dee2e6;'>", unsafe_allow_html=True)
                 # --- Section: View and Manage Submitted Support Requests
                 with gutap_expander("📋 **VIEW & MANAGE SUPPORT REQUESTS**", key="exp_view_manage_support_requests"):
                     st.markdown("""
@@ -11771,3 +11786,10 @@ GU-TAP System
                                         st.rerun()
                                     except Exception as e:
                                         st.error(f"Error updating Google Sheets: {str(e)}")
+
+
+# --- Reminder sweeps: last, after the page has drawn ---------------------------------------
+# Runs once per login. Any notice lands in the spot reserved near the top of the page.
+if _REMINDER_SWEEP_BOX is not None:
+    with _REMINDER_SWEEP_BOX:
+        run_reminder_sweeps()
